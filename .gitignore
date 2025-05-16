@@ -2,6 +2,7 @@
 cache_gnn/
 cache_logistic/
 archive/
+results/
 
 # Data directories
 embeddings/
