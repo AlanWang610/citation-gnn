@@ -1,0 +1,43 @@
+# Cache directories
+cache_gnn/
+cache_logistic/
+archive/
+
+# Data directories
+embeddings/
+scraped_articles/
+
+# Data files
+articles.jsonl
+*.pkl
+*.gpickle
+
+# Generated images
+*.png
+*.jpg
+*.jpeg
+
+# Python cache files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environment
+venv/
+env/
+.env/
+
+# IDE files
+.vscode/
+.idea/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+
+# Logs
+*.log 
