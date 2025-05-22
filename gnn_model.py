@@ -26,6 +26,10 @@ from torch.utils.data import DataLoader, TensorDataset
 from torch_geometric.data import Data
 from torch_geometric.utils import from_networkx
 
+# For inductive model
+from transformers import AutoTokenizer, AutoModel
+from sklearn.preprocessing import StandardScaler
+
 # Local imports
 from create_gnn_graphs import (
     should_filter_title, format_authors, add_period_variants, 
@@ -33,6 +37,483 @@ from create_gnn_graphs import (
     format_author_name, get_journal_encoding, load_paper_embeddings, 
     process_articles_to_gnn_graph, save_gnn_graph, print_graph_statistics
 )
+
+# Global variables for the inductive model
+global_tokenizer = None
+global_model = None
+global_year_scaler = None
+global_embedding_dim = 768  # Default SciBERT embedding dimension
+
+def load_scibert_model():
+    """
+    Load SciBERT model and tokenizer for embedding generation.
+    
+    Returns:
+        Tuple of (tokenizer, model)
+    """
+    global global_tokenizer, global_model
+    
+    if global_tokenizer is None or global_model is None:
+        print("Loading SciBERT model and tokenizer...")
+        global_tokenizer = AutoTokenizer.from_pretrained('allenai/scibert_scivocab_uncased')
+        global_model = AutoModel.from_pretrained('allenai/scibert_scivocab_uncased')
+    
+    return global_tokenizer, global_model
+
+def generate_scibert_embedding(text, tokenizer=None, model=None):
+    """
+    Generate SciBERT embedding for the given text.
+    
+    Args:
+        text: Text to embed
+        tokenizer: SciBERT tokenizer (optional)
+        model: SciBERT model (optional)
+        
+    Returns:
+        SciBERT embedding (numpy array)
+    """
+    # Load model if not provided
+    if tokenizer is None or model is None:
+        tokenizer, model = load_scibert_model()
+    
+    # Tokenize and embed
+    inputs = tokenizer(text, return_tensors="pt", padding=True, truncation=True, max_length=512)
+    with torch.no_grad():
+        outputs = model(**inputs)
+    embedding = outputs.last_hidden_state[:, 0, :].numpy()[0]  # Get the [CLS] token embedding
+    
+    return embedding
+
+def get_text_to_embed(title, abstract=None):
+    """
+    Combine title and abstract for embedding.
+    
+    Args:
+        title: Paper title
+        abstract: Paper abstract (optional)
+        
+    Returns:
+        Combined text for embedding
+    """
+    if abstract and isinstance(abstract, str) and abstract.strip():
+        return title + " " + abstract
+    else:
+        return title
+
+def create_year_scaler(G):
+    """
+    Create a scaler for year normalization based on existing graph.
+    
+    Args:
+        G: NetworkX graph with existing papers
+        
+    Returns:
+        StandardScaler fitted on year data
+    """
+    global global_year_scaler
+    
+    # Extract years from graph
+    years = []
+    for node in G.nodes():
+        year = G.nodes[node].get('year', 0)
+        if isinstance(year, str) and year.isdigit():
+            year = int(year)
+        years.append(year)
+    
+    # Create and fit scaler
+    years = np.array(years).reshape(-1, 1)
+    scaler = StandardScaler()
+    scaler.fit(years)
+    
+    # Store globally
+    global_year_scaler = scaler
+    
+    return scaler
+
+def generate_node_features_for_new_paper(paper_json, G, metadata=None, normalize_year=True):
+    """
+    Generate node features for a new paper in the same format as the existing graph.
+    
+    Args:
+        paper_json: Dictionary containing paper information
+        G: NetworkX graph with existing papers
+        metadata: Dictionary of paper metadata (optional)
+        normalize_year: Whether to normalize the year feature
+        
+    Returns:
+        Tuple of (node_id, node_features, paper_metadata)
+    """
+    # Extract paper information
+    title = paper_json.get('title', '')
+    year = paper_json.get('published_date', '').split('-')[0]
+    journal = paper_json.get('journal', '')
+    authors = paper_json.get('authors', [])
+    abstract = paper_json.get('abstract', '')
+    
+    # Format authors
+    formatted_authors = format_authors(authors)
+    
+    # Create paper ID
+    paper_id = get_paper_id(title, authors, year)
+    
+    # Generate SciBERT embedding
+    text_to_embed = get_text_to_embed(title, abstract)
+    scibert_embedding = generate_scibert_embedding(text_to_embed)
+    
+    # Get journal encoding
+    journal_encoding = get_journal_encoding(journal)
+    
+    # Get embedding dimension
+    if G and len(G.nodes()) > 0:
+        first_node = list(G.nodes())[0]
+        global_embedding_dim = len(G.nodes[first_node]['scibert_embedding'])
+    
+    # Check if scibert_embedding needs to be resized
+    if len(scibert_embedding) != global_embedding_dim:
+        # If dimension doesn't match, we need to handle this
+        # Options: 1) Truncate, 2) Pad with zeros, 3) Use dimensionality reduction
+        if len(scibert_embedding) > global_embedding_dim:
+            # Truncate
+            scibert_embedding = scibert_embedding[:global_embedding_dim]
+        else:
+            # Pad with zeros
+            padding = np.zeros(global_embedding_dim - len(scibert_embedding))
+            scibert_embedding = np.concatenate([scibert_embedding, padding])
+    
+    # Convert year to int if possible
+    if isinstance(year, str) and year.isdigit():
+        year = int(year)
+    else:
+        year = 0
+    
+    # Normalize year if requested
+    if normalize_year and global_year_scaler is None and G:
+        create_year_scaler(G)
+    
+    if normalize_year and global_year_scaler is not None:
+        normalized_year = global_year_scaler.transform([[year]])[0][0]
+    else:
+        normalized_year = year
+    
+    # Create is_main_article flag (new papers are main articles)
+    is_main_article = True
+    
+    # Create features array
+    features = np.concatenate([
+        np.array([normalized_year]).reshape(1),  # Year (normalized)
+        np.array(journal_encoding),              # Journal encoding
+        scibert_embedding,                       # SciBERT embedding
+        np.array([1 if is_main_article else 0])  # Is main article
+    ])
+    
+    # Create metadata dictionary
+    paper_metadata = {
+        'id': paper_id,
+        'title': title,
+        'year': year,
+        'journal': journal,
+        'authors': formatted_authors,
+        'is_main_article': is_main_article
+    }
+    
+    return paper_id, features, paper_metadata
+
+def add_paper_to_graph(paper_json, G, metadata, paper_id=None, features=None, paper_metadata=None):
+    """
+    Add a new paper to the existing graph without retraining.
+    
+    Args:
+        paper_json: Dictionary containing paper information
+        G: NetworkX graph with existing papers
+        metadata: Dictionary of paper metadata
+        paper_id: ID of the paper (optional, generated if not provided)
+        features: Pre-computed features (optional)
+        paper_metadata: Pre-computed metadata (optional)
+        
+    Returns:
+        Updated graph and metadata
+    """
+    # Generate features if not provided
+    if paper_id is None or features is None or paper_metadata is None:
+        paper_id, features, paper_metadata = generate_node_features_for_new_paper(paper_json, G, metadata)
+    
+    # Check if paper already exists in graph
+    if paper_id in G:
+        print(f"Warning: Paper '{paper_id}' already exists in graph")
+        return G, metadata
+    
+    # Add node to graph
+    G.add_node(
+        paper_id,
+        year=paper_metadata['year'],
+        journal_encoding=paper_metadata.get('journal_encoding', [0] * 8),  # Default encoding
+        scibert_embedding=features[1+8:-1],  # Extract embedding from features
+        is_main_article=paper_metadata['is_main_article']
+    )
+    
+    # Add to metadata
+    metadata[paper_id] = paper_metadata
+    
+    # Extract references from paper_json
+    references = paper_json.get('references', [])
+    
+    # Add citation edges
+    for ref in references:
+        if ref.get('reference_type') != 'article':
+            continue
+            
+        ref_title = ref.get('title')
+        if not ref_title or should_filter_title(ref_title):
+            continue
+            
+        ref_id = get_paper_id(
+            ref_title,
+            ref.get('authors', []),
+            str(ref.get('year', ''))
+        )
+        
+        if ref_id and ref_id in G:
+            G.add_edge(paper_id, ref_id)
+    
+    return G, metadata
+
+def inductive_recommend_citations(paper_json, G, metadata, model, node_features, 
+                                node_mapping, reverse_mapping, author_coauthor_G=None, 
+                                top_k=10, exclude_observed=True, device='cpu'):
+    """
+    Recommend citations for a new paper in an inductive setting.
+    
+    Args:
+        paper_json: Dictionary containing paper information
+        G: NetworkX graph with existing papers
+        metadata: Dictionary of paper metadata
+        model: Trained EnhancedCitationMLP model
+        node_features: Node features tensor for existing papers
+        node_mapping: Mapping from node IDs to indices
+        reverse_mapping: Mapping from indices to node IDs
+        author_coauthor_G: Author co-authorship graph (optional)
+        top_k: Number of top recommendations to return
+        exclude_observed: Whether to exclude observed citations from recommendations
+        device: Device to run the model on
+        
+    Returns:
+        List of dictionaries containing recommended citations
+    """
+    # Extract observed citations
+    observed_citations = []
+    for ref in paper_json.get('references', []):
+        if ref.get('reference_type') != 'article':
+            continue
+            
+        ref_title = ref.get('title')
+        if not ref_title or should_filter_title(ref_title):
+            continue
+            
+        ref_id = get_paper_id(
+            ref_title,
+            ref.get('authors', []),
+            str(ref.get('year', ''))
+        )
+        
+        if ref_id and ref_id in G:
+            observed_citations.append(ref_id)
+    
+    # Generate features for the new paper
+    paper_id, paper_features, paper_metadata = generate_node_features_for_new_paper(paper_json, G, metadata)
+    
+    # Move model to device
+    model = model.to(device)
+    
+    # Get candidate papers (all papers except the observed citations)
+    candidates = [node for node in G.nodes()]
+    
+    # Exclude observed citations if requested
+    if exclude_observed:
+        candidates = [c for c in candidates if c not in observed_citations]
+    
+    # Convert paper features to tensor
+    paper_features_tensor = torch.tensor(paper_features, dtype=torch.float).to(device)
+    
+    # Prepare batches for prediction
+    batch_size = 1000
+    all_probs = []
+    
+    # Process candidates in batches
+    for i in range(0, len(candidates), batch_size):
+        batch_candidates = candidates[i:i+batch_size]
+        batch_idxs = [node_mapping[c] for c in batch_candidates]
+        
+        # Get source embeddings (repeated for each candidate)
+        src_embeddings = paper_features_tensor.repeat(len(batch_candidates), 1)
+        
+        # Get target embeddings
+        tgt_embeddings = node_features[torch.tensor(batch_idxs, dtype=torch.long).to(device)]
+        
+        # Extract edge features for each candidate
+        edge_features = []
+        for candidate in batch_candidates:
+            features = extract_edge_features(
+                paper_id, 
+                candidate, 
+                G, 
+                metadata, 
+                author_coauthor_G,
+                observed_citations_only=True,
+                observed_citations=observed_citations
+            )
+            edge_features.append(list(features.values()))
+        
+        # Convert edge features to tensor
+        edge_features_tensor = torch.tensor(edge_features, dtype=torch.float).to(device)
+        
+        # Get predictions
+        with torch.no_grad():
+            outputs = model(src_embeddings, tgt_embeddings, edge_features_tensor)
+            probs = outputs.squeeze().cpu().numpy()
+        
+        all_probs.extend(probs)
+    
+    # Rank candidates by probability
+    ranked_indices = np.argsort(-np.array(all_probs))
+    ranked_candidates = [candidates[i] for i in ranked_indices]
+    ranked_probs = [all_probs[i] for i in ranked_indices]
+    
+    # Get top-k recommendations
+    recommendations = []
+    for i, (candidate, prob) in enumerate(zip(ranked_candidates[:top_k], ranked_probs[:top_k])):
+        # Get metadata for the candidate
+        candidate_metadata = metadata.get(candidate, {})
+        recommendation = {
+            'rank': i + 1,
+            'id': candidate,
+            'title': candidate_metadata.get('title', ''),
+            'authors': candidate_metadata.get('authors', ''),
+            'journal': candidate_metadata.get('journal', ''),
+            'score': float(prob)
+        }
+        recommendations.append(recommendation)
+    
+    return recommendations, paper_id, observed_citations, paper_metadata
+
+def inductive_evaluate_with_held_out(paper_json, G, metadata, model, node_features, 
+                                   node_mapping, reverse_mapping, author_coauthor_G=None, 
+                                   observed_ratio=0.75, top_k=10, device='cpu'):
+    """
+    Evaluate citation recommendations for a new paper with held-out citations.
+    
+    Args:
+        paper_json: Dictionary containing paper information
+        G: NetworkX graph with existing papers
+        metadata: Dictionary of paper metadata
+        model: Trained EnhancedCitationMLP model
+        node_features: Node features tensor for existing papers
+        node_mapping: Mapping from node IDs to indices
+        reverse_mapping: Mapping from indices to node IDs
+        author_coauthor_G: Author co-authorship graph (optional)
+        observed_ratio: Ratio of citations to observe
+        top_k: Number of top recommendations to consider
+        device: Device to run the model on
+        
+    Returns:
+        Dictionary of evaluation metrics and recommendations
+    """
+    # Extract all citations
+    all_citations = []
+    for ref in paper_json.get('references', []):
+        if ref.get('reference_type') != 'article':
+            continue
+            
+        ref_title = ref.get('title')
+        if not ref_title or should_filter_title(ref_title):
+            continue
+            
+        ref_id = get_paper_id(
+            ref_title,
+            ref.get('authors', []),
+            str(ref.get('year', ''))
+        )
+        
+        if ref_id and ref_id in G:
+            all_citations.append(ref_id)
+    
+    if len(all_citations) < 2:
+        return {'error': 'Paper has too few citations for evaluation'}
+    
+    # Split citations into observed and held-out sets
+    random.shuffle(all_citations)
+    num_observed = max(1, int(len(all_citations) * observed_ratio))
+    observed_citations = all_citations[:num_observed]
+    held_out_citations = all_citations[num_observed:]
+    
+    # Create a modified paper_json with only observed citations
+    modified_paper_json = paper_json.copy()
+    modified_references = []
+    
+    for ref in paper_json.get('references', []):
+        ref_id = get_paper_id(
+            ref.get('title', ''),
+            ref.get('authors', []),
+            str(ref.get('year', ''))
+        )
+        
+        if ref_id in observed_citations:
+            modified_references.append(ref)
+    
+    modified_paper_json['references'] = modified_references
+    
+    # Get recommendations using the inductive approach
+    recommendations, paper_id, _, paper_metadata = inductive_recommend_citations(
+        modified_paper_json, 
+        G, 
+        metadata, 
+        model, 
+        node_features, 
+        node_mapping, 
+        reverse_mapping, 
+        author_coauthor_G,
+        top_k=top_k,
+        exclude_observed=True,
+        device=device
+    )
+    
+    # Calculate metrics
+    recommended_ids = [rec['id'] for rec in recommendations]
+    hits = [rec for rec in recommendations if rec['id'] in held_out_citations]
+    
+    # Recall@k: proportion of held-out citations in top k recommendations
+    recall = len(hits) / len(held_out_citations) if held_out_citations else 0
+    
+    # Precision@k: proportion of top k recommendations that are correct
+    precision = len(hits) / len(recommendations) if recommendations else 0
+    
+    # NDCG@k
+    dcg = 0
+    for i, rec in enumerate(recommendations):
+        if rec['id'] in held_out_citations:
+            # Log base 2 ranking (starting from 1)
+            dcg += 1 / np.log2(i + 2)
+    
+    # Ideal DCG: all held-out citations at the top positions
+    idcg = 0
+    for i in range(min(len(held_out_citations), top_k)):
+        idcg += 1 / np.log2(i + 2)
+    
+    ndcg = dcg / idcg if idcg > 0 else 0
+    
+    # Return metrics and recommendations
+    return {
+        'paper_id': paper_id,
+        'paper_title': paper_metadata['title'],
+        'total_citations': len(all_citations),
+        'observed_citations': len(observed_citations),
+        'held_out_citations': len(held_out_citations),
+        'hits': len(hits),
+        f'recall@{top_k}': recall,
+        f'precision@{top_k}': precision,
+        f'ndcg@{top_k}': ndcg,
+        'recommendations': recommendations,
+        'held_out_citation_ids': held_out_citations
+    }
 
 def load_articles(articles_file='articles.jsonl'):
     """

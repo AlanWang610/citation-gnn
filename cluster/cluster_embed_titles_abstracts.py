@@ -6,6 +6,7 @@ from sklearn.decomposition import PCA
 from tqdm import tqdm
 from joblib import Parallel, delayed
 import os
+import pickle as pkl
 
 # Load the pickle file with titles and abstracts
 print("Loading data from pickle file...")
@@ -73,3 +74,8 @@ print("Saving dataframe with embeddings...")
 papers_df.to_pickle('papers_with_embeddings.pkl')
 
 print(f"Processed {len(papers_df)} papers. Embeddings shape: {embeddings_array.shape}, PCA shape: {reduced_embeddings.shape}")
+# Save the PCA object for later use
+print("Saving PCA model...")
+with open('pca_model.pkl', 'wb') as f:
+    pkl.dump(pca, f)
+print("PCA model saved to pca_model.pkl")

@@ -6,6 +6,10 @@ Evaluate GNN model for citation recommendation.
 
 This script loads a trained GNN model and recommends additional citations
 for a paper with partial citation information.
+
+The script supports both transductive and inductive settings:
+- Transductive: The paper is already in the graph
+- Inductive: The paper is new and not part of the training data
 """
 
 import json
@@ -25,7 +29,9 @@ from create_gnn_graphs import (
     get_journal_encoding, should_filter_title
 )
 from gnn_model import (
-    EnhancedCitationMLP, extract_edge_features
+    EnhancedCitationMLP, extract_edge_features, 
+    generate_node_features_for_new_paper, inductive_recommend_citations,
+    inductive_evaluate_with_held_out
 )
 
 def load_model_and_data(cache_dir='cache_gnn'):
@@ -274,7 +280,7 @@ def evaluate_with_held_out(paper_json, G, metadata, model, node_features, node_m
         node_features: Node feature tensor
         node_mapping: Mapping from node IDs to indices
         reverse_mapping: Mapping from indices to node IDs
-        author_coauthor_G: Author coauthorship graph
+        author_coauthor_G: Author co-authorship graph
         observed_ratio: Ratio of citations to observe
         top_k: Number of top recommendations to consider
         device: Device to run the model on
@@ -370,7 +376,7 @@ def recommend_for_paper(paper_json, G, metadata, model, node_features, node_mapp
         node_features: Node feature tensor
         node_mapping: Mapping from node IDs to indices
         reverse_mapping: Mapping from indices to node IDs
-        author_coauthor_G: Author coauthorship graph
+        author_coauthor_G: Author co-authorship graph
         top_k: Number of top recommendations to return
         device: Device to run the model on
         
@@ -422,6 +428,8 @@ def main():
                         help='Ratio of citations to observe in evaluation mode')
     parser.add_argument('--device', type=str, default='cpu', choices=['cpu', 'cuda'], 
                         help='Device to run the model on')
+    parser.add_argument('--inductive', action='store_true', 
+                        help='Use inductive mode for new papers not in the graph')
     args = parser.parse_args()
     
     # Check if CUDA is available
@@ -451,34 +459,86 @@ def main():
             "references": [{"reference_type": "book", "doi": "10.1016/b978-0-12-822927-9.00024-0", "year": 2023, "title": "Expectations data in asset pricing", "journal": "Handbook of Economic Expectations", "volume": None, "issue": None, "authors": [["Klaus", "Adam", None], ["Stefan", "Nagel", None]], "working_paper_institution": None}, {"reference_type": "working_paper", "doi": "10.3386/w31856", "year": None, "title": "Who Invests in Crypto? Wealth, Financial Constraints, and Risk Attitudes", "journal": None, "volume": None, "issue": None, "authors": [["Darren", "Aiello", None], ["Scott", "Baker", None], ["Tetyana", "Balyuk", None], ["Marco Di", "Maggio", None], ["Mark", "Johnson", None], ["Jason", "Kotter", None]], "working_paper_institution": None}, {"title": "Regulating cryptocurrencies: Assessing market reactions", "author": "Auer", "year": "2018", "journal": "BIS Q. Rev. Sept.", "reference_type": "article"}, {"reference_type": "article", "doi": "10.1111/0022-1082.00226", "year": 2000, "title": "Trading Is Hazardous to Your Wealth: The Common Stock Investment Performance of Individual Investors", "journal": "The Journal of Finance", "volume": "55", "issue": "2", "authors": [["Brad M.", "Barber", None], ["Terrance", "Odean", None]], "working_paper_institution": None}, {"reference_type": "article", "doi": "10.1016/j.jfineco.2018.04.007", "year": 2018, "title": "Extrapolation and bubbles", "journal": "Journal of Financial Economics", "volume": "129", "issue": "2", "authors": [["Nicholas", "Barberis", None], ["Robin", "Greenwood", None], ["Lawrence", "Jin", None], ["Andrei", "Shleifer", None]], "working_paper_institution": None}]
         }
     
-    # Run in appropriate mode
-    if args.mode == 'evaluate':
-        results = evaluate_with_held_out(
-            paper_json, 
-            G, 
-            metadata, 
-            model, 
-            node_features, 
-            node_mapping, 
-            reverse_mapping, 
-            author_coauthor_G,
-            observed_ratio=args.observed_ratio,
-            top_k=args.top_k,
-            device=args.device
-        )
+    # Check if paper exists in graph
+    paper_id = get_paper_id(
+        paper_json.get('title', ''),
+        paper_json.get('authors', []),
+        paper_json.get('published_date', '').split('-')[0]
+    )
+    
+    # Determine if inductive mode is needed
+    inductive_mode = args.inductive or (paper_id not in G)
+    
+    if inductive_mode:
+        print("Using inductive mode for citation recommendation")
+        
+        # Run in appropriate mode
+        if args.mode == 'evaluate':
+            results = inductive_evaluate_with_held_out(
+                paper_json, 
+                G, 
+                metadata, 
+                model, 
+                node_features, 
+                node_mapping, 
+                reverse_mapping, 
+                author_coauthor_G,
+                observed_ratio=args.observed_ratio,
+                top_k=args.top_k,
+                device=args.device
+            )
+        else:
+            # Recommend mode
+            recommendations, paper_id, observed_citations, paper_metadata = inductive_recommend_citations(
+                paper_json, 
+                G, 
+                metadata, 
+                model, 
+                node_features, 
+                node_mapping, 
+                reverse_mapping, 
+                author_coauthor_G,
+                top_k=args.top_k,
+                device=args.device
+            )
+            
+            results = {
+                'paper_id': paper_id,
+                'paper_title': paper_metadata['title'],
+                'existing_citations': len(observed_citations),
+                'recommendations': recommendations
+            }
     else:
-        results = recommend_for_paper(
-            paper_json, 
-            G, 
-            metadata, 
-            model, 
-            node_features, 
-            node_mapping, 
-            reverse_mapping, 
-            author_coauthor_G,
-            top_k=args.top_k,
-            device=args.device
-        )
+        print("Using transductive mode for citation recommendation")
+        
+        # Run in appropriate mode
+        if args.mode == 'evaluate':
+            results = evaluate_with_held_out(
+                paper_json, 
+                G, 
+                metadata, 
+                model, 
+                node_features, 
+                node_mapping, 
+                reverse_mapping, 
+                author_coauthor_G,
+                observed_ratio=args.observed_ratio,
+                top_k=args.top_k,
+                device=args.device
+            )
+        else:
+            results = recommend_for_paper(
+                paper_json, 
+                G, 
+                metadata, 
+                model, 
+                node_features, 
+                node_mapping, 
+                reverse_mapping, 
+                author_coauthor_G,
+                top_k=args.top_k,
+                device=args.device
+            )
     
     # Print results
     if 'error' in results:

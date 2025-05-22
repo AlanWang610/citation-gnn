@@ -48,7 +48,8 @@ def format_authors(authors):
     """Convert authors list to string representation."""
     if not authors:
         return ""
-    return "; ".join(" ".join(author) for author in authors)
+    # Filter out None values from each author list before joining
+    return "; ".join(" ".join(item for item in author if item is not None) for author in authors)
 
 def add_period_variants(names):
     """Add variants with periods to journal names."""
