@@ -277,7 +277,7 @@ def load_paper_embeddings(embedding_file):
         print(f"Error loading embeddings: {str(e)}")
         return {}
 
-def process_articles_to_gnn_graph(articles, embedding_file='embeddings/all_papers_with_embeddings.pkl'):
+def process_articles_to_gnn_graph(articles, embedding_file='embeddings/papers_with_embeddings.pkl'):
     """
     Process articles and create a citation network graph for GNN.
     
@@ -543,7 +543,7 @@ def print_graph_statistics(G, metadata):
         print(f"Minimum number of times cited: {min(in_degrees)}")
 
 # Main function to run the graph creation process
-def create_gnn_graphs(articles_file='articles.jsonl', embedding_file='embeddings/all_papers_with_embeddings.pkl'):
+def create_gnn_graphs(articles_file='articles.jsonl', embedding_file='embeddings/papers_with_embeddings.pkl'):
     """
     Main function to create GNN graphs from articles.
     

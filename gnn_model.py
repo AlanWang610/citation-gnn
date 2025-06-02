@@ -42,7 +42,8 @@ from create_gnn_graphs import (
 global_tokenizer = None
 global_model = None
 global_year_scaler = None
-global_embedding_dim = 768  # Default SciBERT embedding dimension
+global_pca_model = None
+global_embedding_dim = 128  # PCA-reduced SciBERT embedding dimension
 
 def load_scibert_model():
     """
@@ -60,29 +61,72 @@ def load_scibert_model():
     
     return global_tokenizer, global_model
 
-def generate_scibert_embedding(text, tokenizer=None, model=None):
+def load_pca_model(pca_path='embeddings/pca_model.pkl'):
     """
-    Generate SciBERT embedding for the given text.
+    Load the fitted PCA model for dimensionality reduction.
+    
+    Args:
+        pca_path: Path to the saved PCA model
+        
+    Returns:
+        Fitted PCA model
+    """
+    global global_pca_model
+    
+    if global_pca_model is None:
+        try:
+            print(f"Loading PCA model from {pca_path}...")
+            with open(pca_path, 'rb') as f:
+                global_pca_model = pkl.load(f)
+            print(f"PCA model loaded successfully. Components: {global_pca_model.n_components_}")
+        except Exception as e:
+            print(f"Error loading PCA model: {e}")
+            print("Will use default 128-dimensional embeddings without PCA")
+            global_pca_model = None
+    
+    return global_pca_model
+
+def generate_scibert_embedding(text, tokenizer=None, model=None, pca_model=None):
+    """
+    Generate SciBERT embedding for the given text with PCA reduction.
     
     Args:
         text: Text to embed
         tokenizer: SciBERT tokenizer (optional)
         model: SciBERT model (optional)
+        pca_model: PCA model for dimensionality reduction (optional)
         
     Returns:
-        SciBERT embedding (numpy array)
+        PCA-reduced SciBERT embedding (numpy array)
     """
-    # Load model if not provided
+    # Load models if not provided
     if tokenizer is None or model is None:
         tokenizer, model = load_scibert_model()
+    
+    if pca_model is None:
+        pca_model = load_pca_model()
     
     # Tokenize and embed
     inputs = tokenizer(text, return_tensors="pt", padding=True, truncation=True, max_length=512)
     with torch.no_grad():
         outputs = model(**inputs)
-    embedding = outputs.last_hidden_state[:, 0, :].numpy()[0]  # Get the [CLS] token embedding
+    raw_embedding = outputs.last_hidden_state[:, 0, :].numpy()[0]  # Get the [CLS] token embedding
     
-    return embedding
+    # Apply PCA reduction if available
+    if pca_model is not None:
+        try:
+            # Reshape for PCA (expects 2D array)
+            pca_embedding = pca_model.transform(raw_embedding.reshape(1, -1))[0]
+            return pca_embedding
+        except Exception as e:
+            print(f"Error applying PCA: {e}")
+            print("Falling back to truncated raw embedding")
+            # Fallback: truncate to expected dimension
+            return raw_embedding[:global_embedding_dim]
+    else:
+        # Fallback: truncate raw embedding to expected dimension
+        print("No PCA model available, truncating raw embedding")
+        return raw_embedding[:global_embedding_dim]
 
 def get_text_to_embed(title, abstract=None):
     """
@@ -156,29 +200,12 @@ def generate_node_features_for_new_paper(paper_json, G, metadata=None, normalize
     # Create paper ID
     paper_id = get_paper_id(title, authors, year)
     
-    # Generate SciBERT embedding
+    # Generate SciBERT embedding with PCA reduction
     text_to_embed = get_text_to_embed(title, abstract)
     scibert_embedding = generate_scibert_embedding(text_to_embed)
     
     # Get journal encoding
     journal_encoding = get_journal_encoding(journal)
-    
-    # Get embedding dimension
-    if G and len(G.nodes()) > 0:
-        first_node = list(G.nodes())[0]
-        global_embedding_dim = len(G.nodes[first_node]['scibert_embedding'])
-    
-    # Check if scibert_embedding needs to be resized
-    if len(scibert_embedding) != global_embedding_dim:
-        # If dimension doesn't match, we need to handle this
-        # Options: 1) Truncate, 2) Pad with zeros, 3) Use dimensionality reduction
-        if len(scibert_embedding) > global_embedding_dim:
-            # Truncate
-            scibert_embedding = scibert_embedding[:global_embedding_dim]
-        else:
-            # Pad with zeros
-            padding = np.zeros(global_embedding_dim - len(scibert_embedding))
-            scibert_embedding = np.concatenate([scibert_embedding, padding])
     
     # Convert year to int if possible
     if isinstance(year, str) and year.isdigit():
@@ -202,7 +229,7 @@ def generate_node_features_for_new_paper(paper_json, G, metadata=None, normalize
     features = np.concatenate([
         np.array([normalized_year]).reshape(1),  # Year (normalized)
         np.array(journal_encoding),              # Journal encoding
-        scibert_embedding,                       # SciBERT embedding
+        scibert_embedding,                       # SciBERT embedding (PCA-reduced)
         np.array([1 if is_main_article else 0])  # Is main article
     ])
     
@@ -279,7 +306,7 @@ def add_paper_to_graph(paper_json, G, metadata, paper_id=None, features=None, pa
 
 def inductive_recommend_citations(paper_json, G, metadata, model, node_features, 
                                 node_mapping, reverse_mapping, author_coauthor_G=None, 
-                                top_k=10, exclude_observed=True, device='cpu'):
+                                top_k=10, exclude_observed=True, device='cpu', include_feature_importance=False):
     """
     Recommend citations for a new paper in an inductive setting.
     
@@ -295,6 +322,7 @@ def inductive_recommend_citations(paper_json, G, metadata, model, node_features,
         top_k: Number of top recommendations to return
         exclude_observed: Whether to exclude observed citations from recommendations
         device: Device to run the model on
+        include_feature_importance: Whether to include feature importance analysis
         
     Returns:
         List of dictionaries containing recommended citations
@@ -337,6 +365,7 @@ def inductive_recommend_citations(paper_json, G, metadata, model, node_features,
     # Prepare batches for prediction
     batch_size = 1000
     all_probs = []
+    all_edge_features = []
     
     # Process candidates in batches
     for i in range(0, len(candidates), batch_size):
@@ -365,6 +394,7 @@ def inductive_recommend_citations(paper_json, G, metadata, model, node_features,
         
         # Convert edge features to tensor
         edge_features_tensor = torch.tensor(edge_features, dtype=torch.float).to(device)
+        all_edge_features.extend(edge_features)
         
         # Get predictions
         with torch.no_grad():
@@ -377,10 +407,26 @@ def inductive_recommend_citations(paper_json, G, metadata, model, node_features,
     ranked_indices = np.argsort(-np.array(all_probs))
     ranked_candidates = [candidates[i] for i in ranked_indices]
     ranked_probs = [all_probs[i] for i in ranked_indices]
+    ranked_edge_features = [all_edge_features[i] for i in ranked_indices]
+    
+    # Get edge feature names
+    if candidates:
+        sample_features = extract_edge_features(
+            paper_id, 
+            candidates[0], 
+            G, 
+            metadata, 
+            author_coauthor_G,
+            observed_citations_only=True,
+            observed_citations=observed_citations
+        )
+        edge_feature_names = list(sample_features.keys())
+    else:
+        edge_feature_names = []
     
     # Get top-k recommendations
     recommendations = []
-    for i, (candidate, prob) in enumerate(zip(ranked_candidates[:top_k], ranked_probs[:top_k])):
+    for i, (candidate, prob, edge_feat) in enumerate(zip(ranked_candidates[:top_k], ranked_probs[:top_k], ranked_edge_features[:top_k])):
         # Get metadata for the candidate
         candidate_metadata = metadata.get(candidate, {})
         recommendation = {
@@ -391,13 +437,27 @@ def inductive_recommend_citations(paper_json, G, metadata, model, node_features,
             'journal': candidate_metadata.get('journal', ''),
             'score': float(prob)
         }
+        
+        # Add feature importance analysis if requested
+        if include_feature_importance:
+            src_embedding = paper_features_tensor[0]  # Get first element since it's repeated
+            tgt_idx = node_mapping[candidate]
+            tgt_embedding = node_features[tgt_idx]
+            edge_features_tensor = torch.tensor(edge_feat, dtype=torch.float)
+            
+            importance_analysis = analyze_prediction_feature_importance(
+                model, src_embedding, tgt_embedding, edge_features_tensor, 
+                edge_feature_names, device
+            )
+            recommendation['feature_importance'] = importance_analysis
+        
         recommendations.append(recommendation)
     
     return recommendations, paper_id, observed_citations, paper_metadata
 
 def inductive_evaluate_with_held_out(paper_json, G, metadata, model, node_features, 
                                    node_mapping, reverse_mapping, author_coauthor_G=None, 
-                                   observed_ratio=0.75, top_k=10, device='cpu'):
+                                   observed_ratio=0.75, top_k=10, device='cpu', random_seed=111, include_feature_importance=False):
     """
     Evaluate citation recommendations for a new paper with held-out citations.
     
@@ -413,6 +473,8 @@ def inductive_evaluate_with_held_out(paper_json, G, metadata, model, node_featur
         observed_ratio: Ratio of citations to observe
         top_k: Number of top recommendations to consider
         device: Device to run the model on
+        random_seed: Random seed for reproducible citation splitting (default: 111)
+        include_feature_importance: Whether to include feature importance analysis
         
     Returns:
         Dictionary of evaluation metrics and recommendations
@@ -438,6 +500,9 @@ def inductive_evaluate_with_held_out(paper_json, G, metadata, model, node_featur
     
     if len(all_citations) < 2:
         return {'error': 'Paper has too few citations for evaluation'}
+    
+    # Set random seed for reproducible results
+    random.seed(random_seed)
     
     # Split citations into observed and held-out sets
     random.shuffle(all_citations)
@@ -473,7 +538,8 @@ def inductive_evaluate_with_held_out(paper_json, G, metadata, model, node_featur
         author_coauthor_G,
         top_k=top_k,
         exclude_observed=True,
-        device=device
+        device=device,
+        include_feature_importance=include_feature_importance
     )
     
     # Calculate metrics
@@ -545,7 +611,7 @@ def load_articles(articles_file='articles.jsonl'):
     print(f"Loaded {len(articles)} articles")
     return articles
 
-def build_gnn_graph(articles, embedding_file='embeddings/all_papers_with_embeddings.pkl'):
+def build_gnn_graph(articles, embedding_file='embeddings/papers_with_embeddings.pkl'):
     """
     Build a graph for GNN-based citation recommendation.
     
@@ -1878,6 +1944,118 @@ def evaluate_citation_recommendations(model, data, citation_data, G, metadata, t
         f'recall@{top_k}': avg_recall,
         f'precision@{top_k}': avg_precision,
         f'ndcg@{top_k}': avg_ndcg
+    }
+
+def analyze_prediction_feature_importance(model, src_embedding, tgt_embedding, edge_features, edge_feature_names, device='cpu'):
+    """
+    Analyze feature importance for a single prediction by measuring contribution of:
+    1. Node embedding distance/similarity
+    2. Individual edge features
+    
+    Args:
+        model: Trained EnhancedCitationMLP model
+        src_embedding: Source node embedding tensor [1, embedding_dim]
+        tgt_embedding: Target node embedding tensor [1, embedding_dim]
+        edge_features: Edge features tensor [1, edge_feature_dim]
+        edge_feature_names: List of edge feature names
+        device: Device to run on
+        
+    Returns:
+        Dictionary with feature importance analysis
+    """
+    model.eval()
+    model = model.to(device)
+    
+    # Ensure inputs are on the correct device and have batch dimension
+    if src_embedding.dim() == 1:
+        src_embedding = src_embedding.unsqueeze(0)
+    if tgt_embedding.dim() == 1:
+        tgt_embedding = tgt_embedding.unsqueeze(0)
+    if edge_features.dim() == 1:
+        edge_features = edge_features.unsqueeze(0)
+    
+    src_embedding = src_embedding.to(device)
+    tgt_embedding = tgt_embedding.to(device)
+    edge_features = edge_features.to(device)
+    
+    # Get baseline prediction
+    with torch.no_grad():
+        baseline_output = model(src_embedding, tgt_embedding, edge_features)
+        baseline_score = baseline_output.item()
+    
+    # Calculate node embedding similarity metrics
+    node_embedding_dim = src_embedding.shape[1]
+    
+    # Cosine similarity
+    cosine_sim = torch.nn.functional.cosine_similarity(src_embedding, tgt_embedding, dim=1).item()
+    
+    # Euclidean distance (normalized by embedding dimension)
+    euclidean_dist = torch.norm(src_embedding - tgt_embedding, dim=1).item() / np.sqrt(node_embedding_dim)
+    
+    # L1 distance (normalized)
+    l1_dist = torch.norm(src_embedding - tgt_embedding, p=1, dim=1).item() / node_embedding_dim
+    
+    # Test importance of node embeddings vs edge features
+    # 1. Prediction with zero node embeddings (only edge features)
+    zero_embeddings = torch.zeros_like(src_embedding)
+    with torch.no_grad():
+        edge_only_output = model(zero_embeddings, zero_embeddings, edge_features)
+        edge_only_score = edge_only_output.item()
+    
+    # 2. Prediction with zero edge features (only node embeddings)
+    zero_edge_features = torch.zeros_like(edge_features)
+    with torch.no_grad():
+        embedding_only_output = model(src_embedding, tgt_embedding, zero_edge_features)
+        embedding_only_score = embedding_only_output.item()
+    
+    # Calculate contributions
+    node_embedding_contribution = abs(baseline_score - edge_only_score)
+    edge_feature_contribution = abs(baseline_score - embedding_only_score)
+    
+    # Analyze individual edge feature importance
+    edge_importance = {}
+    for i, feature_name in enumerate(edge_feature_names):
+        # Create modified edge features with this feature zeroed out
+        modified_edge_features = edge_features.clone()
+        modified_edge_features[0, i] = 0
+        
+        with torch.no_grad():
+            modified_output = model(src_embedding, tgt_embedding, modified_edge_features)
+            modified_score = modified_output.item()
+        
+        # Importance is the absolute change in prediction
+        importance = abs(baseline_score - modified_score)
+        edge_importance[feature_name] = {
+            'importance': importance,
+            'feature_value': edge_features[0, i].item(),
+            'score_change': baseline_score - modified_score
+        }
+    
+    # Sort edge features by importance
+    sorted_edge_importance = dict(sorted(edge_importance.items(), 
+                                       key=lambda x: x[1]['importance'], 
+                                       reverse=True))
+    
+    return {
+        'baseline_score': baseline_score,
+        'node_embedding_metrics': {
+            'cosine_similarity': cosine_sim,
+            'euclidean_distance': euclidean_dist,
+            'l1_distance': l1_dist,
+            'contribution': node_embedding_contribution,
+            'embedding_only_score': embedding_only_score
+        },
+        'edge_feature_metrics': {
+            'total_contribution': edge_feature_contribution,
+            'edge_only_score': edge_only_score,
+            'individual_importance': sorted_edge_importance
+        },
+        'contribution_breakdown': {
+            'node_embeddings': node_embedding_contribution,
+            'edge_features': edge_feature_contribution,
+            'node_embedding_percentage': node_embedding_contribution / (node_embedding_contribution + edge_feature_contribution) * 100 if (node_embedding_contribution + edge_feature_contribution) > 0 else 0,
+            'edge_feature_percentage': edge_feature_contribution / (node_embedding_contribution + edge_feature_contribution) * 100 if (node_embedding_contribution + edge_feature_contribution) > 0 else 0
+        }
     }
 
 def main():

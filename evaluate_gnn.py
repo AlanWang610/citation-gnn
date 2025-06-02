@@ -31,12 +31,13 @@ from create_gnn_graphs import (
 from gnn_model import (
     EnhancedCitationMLP, extract_edge_features, 
     generate_node_features_for_new_paper, inductive_recommend_citations,
-    inductive_evaluate_with_held_out
+    inductive_evaluate_with_held_out, analyze_prediction_feature_importance
 )
 
 def load_model_and_data(cache_dir='cache_gnn'):
     """
     Load the trained model and graph data from cache.
+    If cache files are missing, regenerate them.
     
     Args:
         cache_dir: Directory containing cached files
@@ -55,9 +56,24 @@ def load_model_and_data(cache_dir='cache_gnn'):
     
     # Check if all required files exist
     required_files = [gnn_graph_path, gnn_metadata_path, gnn_data_path, model_path]
-    for file_path in required_files:
-        if not os.path.exists(file_path):
-            raise FileNotFoundError(f"Required file not found: {file_path}")
+    missing_files = [f for f in required_files if not os.path.exists(f)]
+    
+    if missing_files:
+        print(f"Missing cache files: {missing_files}")
+        print("Regenerating cache files...")
+        
+        # Import the main function from gnn_model to regenerate cache
+        from gnn_model import main as gnn_main
+        
+        # Run the main function to regenerate all cache files
+        gnn_main()
+        
+        # Check again if files exist after regeneration
+        still_missing = [f for f in required_files if not os.path.exists(f)]
+        if still_missing:
+            raise FileNotFoundError(f"Failed to regenerate required files: {still_missing}")
+        
+        print("Successfully regenerated cache files")
     
     # Load graph and metadata
     print("Loading citation graph...")
@@ -165,7 +181,7 @@ def parse_paper(paper_json, G, metadata):
 
 def recommend_citations(paper_id, observed_citations, G, metadata, model, node_features, 
                        node_mapping, reverse_mapping, author_coauthor_G, top_k=10, 
-                       exclude_observed=True, device='cpu'):
+                       exclude_observed=True, device='cpu', include_feature_importance=False):
     """
     Recommend citations for a paper based on partial citation information.
     
@@ -182,6 +198,7 @@ def recommend_citations(paper_id, observed_citations, G, metadata, model, node_f
         top_k: Number of top recommendations to return
         exclude_observed: Whether to exclude observed citations from recommendations
         device: Device to run the model on
+        include_feature_importance: Whether to include feature importance analysis
         
     Returns:
         List of dictionaries containing recommended citations
@@ -208,6 +225,7 @@ def recommend_citations(paper_id, observed_citations, G, metadata, model, node_f
     # Prepare batches for prediction
     batch_size = 1000
     all_probs = []
+    all_edge_features = []
     
     # Process candidates in batches
     for i in range(0, len(candidates), batch_size):
@@ -236,6 +254,7 @@ def recommend_citations(paper_id, observed_citations, G, metadata, model, node_f
         
         # Convert edge features to tensor
         edge_features_tensor = torch.tensor(edge_features, dtype=torch.float).to(device)
+        all_edge_features.extend(edge_features)
         
         # Get predictions
         with torch.no_grad():
@@ -248,10 +267,26 @@ def recommend_citations(paper_id, observed_citations, G, metadata, model, node_f
     ranked_indices = np.argsort(-np.array(all_probs))
     ranked_candidates = [candidates[i] for i in ranked_indices]
     ranked_probs = [all_probs[i] for i in ranked_indices]
+    ranked_edge_features = [all_edge_features[i] for i in ranked_indices]
+    
+    # Get edge feature names
+    if candidates:
+        sample_features = extract_edge_features(
+            paper_id, 
+            candidates[0], 
+            G, 
+            metadata, 
+            author_coauthor_G,
+            observed_citations_only=True,
+            observed_citations=observed_citations
+        )
+        edge_feature_names = list(sample_features.keys())
+    else:
+        edge_feature_names = []
     
     # Get top-k recommendations
     recommendations = []
-    for i, (candidate, prob) in enumerate(zip(ranked_candidates[:top_k], ranked_probs[:top_k])):
+    for i, (candidate, prob, edge_feat) in enumerate(zip(ranked_candidates[:top_k], ranked_probs[:top_k], ranked_edge_features[:top_k])):
         # Get metadata for the candidate
         candidate_metadata = metadata.get(candidate, {})
         recommendation = {
@@ -262,13 +297,27 @@ def recommend_citations(paper_id, observed_citations, G, metadata, model, node_f
             'journal': candidate_metadata.get('journal', ''),
             'score': float(prob)
         }
+        
+        # Add feature importance analysis if requested
+        if include_feature_importance:
+            src_embedding = node_features[src_idx]
+            tgt_idx = node_mapping[candidate]
+            tgt_embedding = node_features[tgt_idx]
+            edge_features_tensor = torch.tensor(edge_feat, dtype=torch.float)
+            
+            importance_analysis = analyze_prediction_feature_importance(
+                model, src_embedding, tgt_embedding, edge_features_tensor, 
+                edge_feature_names, device
+            )
+            recommendation['feature_importance'] = importance_analysis
+        
         recommendations.append(recommendation)
     
     return recommendations
 
 def evaluate_with_held_out(paper_json, G, metadata, model, node_features, node_mapping, 
                           reverse_mapping, author_coauthor_G, observed_ratio=0.75, 
-                          top_k=10, device='cpu'):
+                          top_k=10, device='cpu', include_feature_importance=False, random_seed=111):
     """
     Evaluate citation recommendations against held-out citations.
     
@@ -284,6 +333,8 @@ def evaluate_with_held_out(paper_json, G, metadata, model, node_features, node_m
         observed_ratio: Ratio of citations to observe
         top_k: Number of top recommendations to consider
         device: Device to run the model on
+        include_feature_importance: Whether to include feature importance analysis
+        random_seed: Random seed for reproducible citation splitting (default: 111)
         
     Returns:
         Dictionary of evaluation metrics and recommendations
@@ -296,6 +347,9 @@ def evaluate_with_held_out(paper_json, G, metadata, model, node_features, node_m
     
     if len(all_citations) < 2:
         return {'error': 'Paper has too few citations for evaluation'}
+    
+    # Set random seed for reproducible results
+    random.seed(random_seed)
     
     # Split citations into observed and held-out sets
     random.shuffle(all_citations)
@@ -321,7 +375,8 @@ def evaluate_with_held_out(paper_json, G, metadata, model, node_features, node_m
         author_coauthor_G,
         top_k=top_k,
         exclude_observed=True,
-        device=device
+        device=device,
+        include_feature_importance=include_feature_importance
     )
     
     # Calculate metrics
@@ -364,7 +419,7 @@ def evaluate_with_held_out(paper_json, G, metadata, model, node_features, node_m
     }
 
 def recommend_for_paper(paper_json, G, metadata, model, node_features, node_mapping, 
-                       reverse_mapping, author_coauthor_G, top_k=10, device='cpu'):
+                       reverse_mapping, author_coauthor_G, top_k=10, device='cpu', include_feature_importance=False):
     """
     Recommend citations for a paper based on its existing citations.
     
@@ -379,6 +434,7 @@ def recommend_for_paper(paper_json, G, metadata, model, node_features, node_mapp
         author_coauthor_G: Author co-authorship graph
         top_k: Number of top recommendations to return
         device: Device to run the model on
+        include_feature_importance: Whether to include feature importance analysis
         
     Returns:
         Dictionary containing recommendations and paper information
@@ -405,7 +461,8 @@ def recommend_for_paper(paper_json, G, metadata, model, node_features, node_mapp
         author_coauthor_G,
         top_k=top_k,
         exclude_observed=True,
-        device=device
+        device=device,
+        include_feature_importance=include_feature_importance
     )
     
     # Return recommendations and paper information
@@ -430,6 +487,10 @@ def main():
                         help='Device to run the model on')
     parser.add_argument('--inductive', action='store_true', 
                         help='Use inductive mode for new papers not in the graph')
+    parser.add_argument('--feature-importance', action='store_true',
+                        help='Include detailed feature importance analysis for each recommendation')
+    parser.add_argument('--random-seed', type=int, default=111,
+                        help='Random seed for reproducible evaluation results (default: 111)')
     args = parser.parse_args()
     
     # Check if CUDA is available
@@ -485,7 +546,9 @@ def main():
                 author_coauthor_G,
                 observed_ratio=args.observed_ratio,
                 top_k=args.top_k,
-                device=args.device
+                device=args.device,
+                random_seed=args.random_seed,
+                include_feature_importance=args.feature_importance
             )
         else:
             # Recommend mode
@@ -499,7 +562,8 @@ def main():
                 reverse_mapping, 
                 author_coauthor_G,
                 top_k=args.top_k,
-                device=args.device
+                device=args.device,
+                include_feature_importance=args.feature_importance
             )
             
             results = {
@@ -524,7 +588,9 @@ def main():
                 author_coauthor_G,
                 observed_ratio=args.observed_ratio,
                 top_k=args.top_k,
-                device=args.device
+                device=args.device,
+                include_feature_importance=args.feature_importance,
+                random_seed=args.random_seed
             )
         else:
             results = recommend_for_paper(
@@ -537,7 +603,8 @@ def main():
                 reverse_mapping, 
                 author_coauthor_G,
                 top_k=args.top_k,
-                device=args.device
+                device=args.device,
+                include_feature_importance=args.feature_importance
             )
     
     # Print results

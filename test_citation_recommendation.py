@@ -17,6 +17,37 @@ import os
 import argparse
 import random
 
+def format_feature_importance(importance_data):
+    """Format feature importance data for display."""
+    if not importance_data:
+        return ""
+    
+    lines = []
+    lines.append(f"    📊 FEATURE IMPORTANCE ANALYSIS:")
+    lines.append(f"    ├─ Prediction Score: {importance_data['baseline_score']:.4f}")
+    
+    # Node embedding analysis
+    node_metrics = importance_data['node_embedding_metrics']
+    lines.append(f"    ├─ Node Embedding Analysis:")
+    lines.append(f"    │  ├─ Cosine Similarity: {node_metrics['cosine_similarity']:.4f}")
+    lines.append(f"    │  ├─ Euclidean Distance: {node_metrics['euclidean_distance']:.4f}")
+    lines.append(f"    │  └─ Contribution: {node_metrics['contribution']:.4f}")
+    
+    # Contribution breakdown
+    breakdown = importance_data['contribution_breakdown']
+    lines.append(f"    ├─ Overall Contribution:")
+    lines.append(f"    │  ├─ Node Embeddings: {breakdown['node_embedding_percentage']:.1f}%")
+    lines.append(f"    │  └─ Edge Features: {breakdown['edge_feature_percentage']:.1f}%")
+    
+    # Top edge features
+    edge_importance = importance_data['edge_feature_metrics']['individual_importance']
+    lines.append(f"    └─ Top Edge Features:")
+    for i, (feature_name, feature_data) in enumerate(list(edge_importance.items())[:3]):
+        symbol = "├─" if i < 2 else "└─"
+        lines.append(f"       {symbol} {feature_name}: {feature_data['importance']:.4f} (value: {feature_data['feature_value']:.2f})")
+    
+    return "\n".join(lines)
+
 def main():
     """Main function to run the test."""
     parser = argparse.ArgumentParser(description='Test citation recommendation system')
@@ -30,7 +61,12 @@ def main():
                         help='Use transductive mode (default is inductive)')
     parser.add_argument('--test-paper', type=str, default=None,
                         help='Path to a JSON file containing a test paper (optional)')
+    parser.add_argument('--feature-importance', action='store_true', default=True,
+                        help='Include detailed feature importance analysis for each recommendation (enabled by default)')
     args = parser.parse_args()
+    
+    # Force feature importance to always be True
+    args.feature_importance = True
     
     # Create output directory if it doesn't exist
     os.makedirs(args.output_dir, exist_ok=True)
@@ -48,6 +84,9 @@ def main():
     # Set inductive mode flag
     inductive_flag = "--inductive" if args.inductive else ""
     
+    # Set feature importance flag
+    feature_importance_flag = "--feature-importance" if args.feature_importance else ""
+    
     # Run evaluate_gnn.py in evaluation mode
     evaluation_output_path = os.path.join(args.output_dir, 'evaluation_results.json')
     
@@ -55,7 +94,7 @@ def main():
     mode_name = "inductive" if args.inductive else "transductive"
     
     # Evaluation command
-    cmd = f"python evaluate_gnn.py --input {example_paper_path} --output {evaluation_output_path} --mode evaluate --observed-ratio {args.observed_ratio} --top-k {args.top_k} --device {args.device} {inductive_flag}"
+    cmd = f"python evaluate_gnn.py --input {example_paper_path} --output {evaluation_output_path} --mode evaluate --observed-ratio {args.observed_ratio} --top-k {args.top_k} --device {args.device} {inductive_flag} {feature_importance_flag}"
     
     print(f"Running {mode_name} evaluation: {cmd}")
     os.system(cmd)
@@ -87,7 +126,7 @@ def main():
     
     # Run evaluate_gnn.py in recommendation mode
     recommendation_output_path = os.path.join(args.output_dir, 'recommendation_results.json')
-    cmd = f"python evaluate_gnn.py --input {example_paper_path} --output {recommendation_output_path} --mode recommend --top-k {args.top_k} --device {args.device} {inductive_flag}"
+    cmd = f"python evaluate_gnn.py --input {example_paper_path} --output {recommendation_output_path} --mode recommend --top-k {args.top_k} --device {args.device} {inductive_flag} {feature_importance_flag}"
     
     print(f"Running {mode_name} recommendation: {cmd}")
     os.system(cmd)
@@ -136,15 +175,22 @@ def main():
                     print(f"Precision@{args.top_k}: {evaluation_results[f'precision@{args.top_k}']:.4f}")
                     print(f"NDCG@{args.top_k}: {evaluation_results[f'ndcg@{args.top_k}']:.4f}")
                 
-                # Print top recommendations with status markers
-                print("\nTop Evaluation Recommendations:")
-                print("-" * 80)
-                for rec in evaluation_results.get('recommendations', [])[:10]:  # Show top 10 for brevity
+                # Print ALL evaluation recommendations with status markers
+                print(f"\nALL Top {args.top_k} Evaluation Recommendations:")
+                print("=" * 100)
+                for rec in evaluation_results.get('recommendations', []):
                     status_marker = rec.get('checkbox', '')
-                    print(f"{rec.get('rank', 0)}. {status_marker} {rec.get('title', 'Unknown Title')} (Score: {rec.get('score', 0):.4f})")
-                    print(f"   Authors: {rec.get('authors', '')}")
-                    print(f"   Journal: {rec.get('journal', '')}")
-                    print(f"   Status: {rec.get('status', '')}")
+                    print(f"{rec.get('rank', 0):2d}. {status_marker} {rec.get('title', 'Unknown Title')} (Score: {rec.get('score', 0):.4f})")
+                    print(f"    Authors: {rec.get('authors', '')}")
+                    print(f"    Journal: {rec.get('journal', '')}")
+                    print(f"    Status: {rec.get('status', '')}")
+                    
+                    # Show feature importance if available
+                    if args.feature_importance and 'feature_importance' in rec:
+                        importance_display = format_feature_importance(rec['feature_importance'])
+                        if importance_display:
+                            print(importance_display)
+                    
                     print()
             
             print("\nRecommendation Results Summary:")
@@ -153,15 +199,22 @@ def main():
             print(f"Already cited papers in recommendations: {already_cited}")
             print(f"New recommendations: {new_recommendations}")
             
-            # Print top recommendations with status markers
-            print("\nTop Recommendation Results:")
-            print("-" * 80)
-            for rec in recommendation_results.get('recommendations', [])[:10]:  # Show top 10 for brevity
+            # Print ALL recommendation results with status markers
+            print(f"\nALL Top {args.top_k} Recommendation Results:")
+            print("=" * 100)
+            for rec in recommendation_results.get('recommendations', []):
                 status_marker = rec.get('checkbox', '')
-                print(f"{rec.get('rank', 0)}. {status_marker} {rec.get('title', 'Unknown Title')} (Score: {rec.get('score', 0):.4f})")
-                print(f"   Authors: {rec.get('authors', '')}")
-                print(f"   Journal: {rec.get('journal', '')}")
-                print(f"   Status: {rec.get('status', '')}")
+                print(f"{rec.get('rank', 0):2d}. {status_marker} {rec.get('title', 'Unknown Title')} (Score: {rec.get('score', 0):.4f})")
+                print(f"    Authors: {rec.get('authors', '')}")
+                print(f"    Journal: {rec.get('journal', '')}")
+                print(f"    Status: {rec.get('status', '')}")
+                
+                # Show feature importance if available
+                if args.feature_importance and 'feature_importance' in rec:
+                    importance_display = format_feature_importance(rec['feature_importance'])
+                    if importance_display:
+                        print(importance_display)
+                
                 print()
     except Exception as e:
         print(f"Error processing recommendation results: {e}")
@@ -171,6 +224,10 @@ def main():
     print(f"Evaluation results saved to {evaluation_output_path}")
     print(f"Recommendation results saved to {recommendation_output_path}")
     print(f"Legend: [✓]=Actual citation that was held out, [ ]=Not cited, [C]=Already cited, [N]=New recommendation")
+    print(f"📊 Feature importance analysis included for each recommendation")
+    print(f"   - Node embeddings: Cosine similarity and contribution to prediction")
+    print(f"   - Edge features: Individual feature importance and values")
+    print(f"   - Contribution breakdown: Percentage split between embeddings vs features")
 
 if __name__ == "__main__":
     main() 

@@ -135,3 +135,7 @@ Metrics include:
 - The model works best when the paper already has some citations
 - The quality of recommendations depends on the coverage of the citation network
 - Papers not in the training data cannot be recommended
+
+## To do
+
+- Explain why a given recommendation was made (i.e. strongest edge feature or node embedding similarity)
