@@ -440,7 +440,7 @@ def inductive_recommend_citations(paper_json, G, metadata, model, node_features,
         
         # Add feature importance analysis if requested
         if include_feature_importance:
-            src_embedding = paper_features_tensor[0]  # Get first element since it's repeated
+            src_embedding = paper_features_tensor  # Use the full tensor, not just first element
             tgt_idx = node_mapping[candidate]
             tgt_embedding = node_features[tgt_idx]
             edge_features_tensor = torch.tensor(edge_feat, dtype=torch.float)
@@ -1954,9 +1954,9 @@ def analyze_prediction_feature_importance(model, src_embedding, tgt_embedding, e
     
     Args:
         model: Trained EnhancedCitationMLP model
-        src_embedding: Source node embedding tensor [1, embedding_dim]
-        tgt_embedding: Target node embedding tensor [1, embedding_dim]
-        edge_features: Edge features tensor [1, edge_feature_dim]
+        src_embedding: Source node embedding tensor [embedding_dim]
+        tgt_embedding: Target node embedding tensor [embedding_dim]
+        edge_features: Edge features tensor [edge_feature_dim]
         edge_feature_names: List of edge feature names
         device: Device to run on
         
@@ -1966,14 +1966,23 @@ def analyze_prediction_feature_importance(model, src_embedding, tgt_embedding, e
     model.eval()
     model = model.to(device)
     
-    # Ensure inputs are on the correct device and have batch dimension
-    if src_embedding.dim() == 1:
-        src_embedding = src_embedding.unsqueeze(0)
-    if tgt_embedding.dim() == 1:
-        tgt_embedding = tgt_embedding.unsqueeze(0)
-    if edge_features.dim() == 1:
-        edge_features = edge_features.unsqueeze(0)
+    # Ensure inputs are tensors and on the correct device
+    if not isinstance(src_embedding, torch.Tensor):
+        src_embedding = torch.tensor(src_embedding, dtype=torch.float)
+    if not isinstance(tgt_embedding, torch.Tensor):
+        tgt_embedding = torch.tensor(tgt_embedding, dtype=torch.float)
+    if not isinstance(edge_features, torch.Tensor):
+        edge_features = torch.tensor(edge_features, dtype=torch.float)
     
+    # Ensure all tensors have batch dimension (add if missing)
+    if src_embedding.dim() == 1:
+        src_embedding = src_embedding.unsqueeze(0)  # Add batch dim
+    if tgt_embedding.dim() == 1:
+        tgt_embedding = tgt_embedding.unsqueeze(0)  # Add batch dim
+    if edge_features.dim() == 1:
+        edge_features = edge_features.unsqueeze(0)  # Add batch dim
+    
+    # Move to device
     src_embedding = src_embedding.to(device)
     tgt_embedding = tgt_embedding.to(device)
     edge_features = edge_features.to(device)
