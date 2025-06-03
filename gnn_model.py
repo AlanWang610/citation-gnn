@@ -1,332 +1,968 @@
-# Standard library imports
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+"""
+GraphSAGE-based citation recommendation model.
+
+This module implements a proper Graph Neural Network using GraphSAGE for learning
+node representations from graph structure, while using SciBERT embedding similarity
+as edge features for semantic understanding.
+"""
+
 import json
 import os
 import pickle as pkl
 import random
-import re
-import unicodedata
+import argparse
 from collections import defaultdict
-from itertools import product
+import time
 
-# Third-party imports
-import matplotlib.pyplot as plt
 import networkx as nx
 import numpy as np
-from sklearn.metrics import (
-    accuracy_score, precision_score, recall_score, 
-    f1_score, roc_auc_score
-)
-from tqdm import tqdm
-
-# PyTorch imports
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 from torch_geometric.data import Data
-from torch_geometric.utils import from_networkx
-
-# For inductive model
-from transformers import AutoTokenizer, AutoModel
+from torch_geometric.nn import SAGEConv
 from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
+from tqdm import tqdm
 
-# Local imports
 from create_gnn_graphs import (
-    should_filter_title, format_authors, add_period_variants, 
-    standardize_journal_name, normalize_name, get_paper_id, 
-    format_author_name, get_journal_encoding, load_paper_embeddings, 
-    process_articles_to_gnn_graph, save_gnn_graph, print_graph_statistics
+    get_paper_id, standardize_journal_name, format_author_name,
+    get_journal_encoding, should_filter_title, load_paper_embeddings
 )
 
-# Global variables for the inductive model
-global_tokenizer = None
-global_model = None
-global_year_scaler = None
-global_pca_model = None
-global_embedding_dim = 128  # PCA-reduced SciBERT embedding dimension
-
 def load_scibert_model():
-    """
-    Load SciBERT model and tokenizer for embedding generation.
-    
-    Returns:
-        Tuple of (tokenizer, model)
-    """
-    global global_tokenizer, global_model
-    
-    if global_tokenizer is None or global_model is None:
+    """Load SciBERT model and tokenizer."""
+    try:
+        from transformers import AutoTokenizer, AutoModel
         print("Loading SciBERT model and tokenizer...")
-        global_tokenizer = AutoTokenizer.from_pretrained('allenai/scibert_scivocab_uncased')
-        global_model = AutoModel.from_pretrained('allenai/scibert_scivocab_uncased')
-    
-    return global_tokenizer, global_model
+        tokenizer = AutoTokenizer.from_pretrained('allenai/scibert_scivocab_uncased')
+        model = AutoModel.from_pretrained('allenai/scibert_scivocab_uncased')
+        model.eval()
+        print("SciBERT model loaded successfully")
+        return tokenizer, model
+    except ImportError:
+        print("Transformers library not available, using dummy embeddings")
+        return None, None
 
 def load_pca_model(pca_path='embeddings/pca_model.pkl'):
-    """
-    Load the fitted PCA model for dimensionality reduction.
-    
-    Args:
-        pca_path: Path to the saved PCA model
-        
-    Returns:
-        Fitted PCA model
-    """
-    global global_pca_model
-    
-    if global_pca_model is None:
-        try:
+    """Load PCA model for embedding reduction."""
+    try:
+        if os.path.exists(pca_path):
             print(f"Loading PCA model from {pca_path}...")
             with open(pca_path, 'rb') as f:
-                global_pca_model = pkl.load(f)
-            print(f"PCA model loaded successfully. Components: {global_pca_model.n_components_}")
-        except Exception as e:
-            print(f"Error loading PCA model: {e}")
-            print("Will use default 128-dimensional embeddings without PCA")
-            global_pca_model = None
-    
-    return global_pca_model
+                pca_model = pkl.load(f)
+            print(f"PCA model loaded successfully. Components: {pca_model.n_components_}")
+            return pca_model
+        else:
+            print(f"PCA model not found at {pca_path}")
+            return None
+    except Exception as e:
+        print(f"Error loading PCA model: {e}")
+        return None
 
-def generate_scibert_embedding(text, tokenizer=None, model=None, pca_model=None):
-    """
-    Generate SciBERT embedding for the given text with PCA reduction.
+def calculate_cosine_similarity(embedding1, embedding2):
+    """Calculate cosine similarity between two embeddings."""
+    if not embedding1 or not embedding2:
+        return 0.0
     
-    Args:
-        text: Text to embed
-        tokenizer: SciBERT tokenizer (optional)
-        model: SciBERT model (optional)
-        pca_model: PCA model for dimensionality reduction (optional)
-        
-    Returns:
-        PCA-reduced SciBERT embedding (numpy array)
-    """
-    # Load models if not provided
-    if tokenizer is None or model is None:
-        tokenizer, model = load_scibert_model()
+    # Convert to numpy arrays
+    emb1 = np.array(embedding1)
+    emb2 = np.array(embedding2)
     
-    if pca_model is None:
-        pca_model = load_pca_model()
+    # Calculate cosine similarity
+    dot_product = np.dot(emb1, emb2)
+    norm1 = np.linalg.norm(emb1)
+    norm2 = np.linalg.norm(emb2)
     
-    # Tokenize and embed
-    inputs = tokenizer(text, return_tensors="pt", padding=True, truncation=True, max_length=512)
-    with torch.no_grad():
-        outputs = model(**inputs)
-    raw_embedding = outputs.last_hidden_state[:, 0, :].numpy()[0]  # Get the [CLS] token embedding
+    if norm1 == 0 or norm2 == 0:
+        return 0.0
     
-    # Apply PCA reduction if available
-    if pca_model is not None:
-        try:
-            # Reshape for PCA (expects 2D array)
-            pca_embedding = pca_model.transform(raw_embedding.reshape(1, -1))[0]
-            return pca_embedding
-        except Exception as e:
-            print(f"Error applying PCA: {e}")
-            print("Falling back to truncated raw embedding")
-            # Fallback: truncate to expected dimension
-            return raw_embedding[:global_embedding_dim]
-    else:
-        # Fallback: truncate raw embedding to expected dimension
-        print("No PCA model available, truncating raw embedding")
-        return raw_embedding[:global_embedding_dim]
-
-def get_text_to_embed(title, abstract=None):
-    """
-    Combine title and abstract for embedding.
-    
-    Args:
-        title: Paper title
-        abstract: Paper abstract (optional)
-        
-    Returns:
-        Combined text for embedding
-    """
-    if abstract and isinstance(abstract, str) and abstract.strip():
-        return title + " " + abstract
-    else:
-        return title
+    return dot_product / (norm1 * norm2)
 
 def create_year_scaler(G):
-    """
-    Create a scaler for year normalization based on existing graph.
-    
-    Args:
-        G: NetworkX graph with existing papers
-        
-    Returns:
-        StandardScaler fitted on year data
-    """
-    global global_year_scaler
-    
-    # Extract years from graph
+    """Create and fit a scaler for year normalization."""
     years = []
-    for node in G.nodes():
-        year = G.nodes[node].get('year', 0)
-        if isinstance(year, str) and year.isdigit():
-            year = int(year)
-        years.append(year)
+    for node_id in G.nodes():
+        year = G.nodes[node_id].get('year', 0)
+        if year > 0:  # Only include valid years
+            years.append(year)
     
-    # Create and fit scaler
-    years = np.array(years).reshape(-1, 1)
-    scaler = StandardScaler()
-    scaler.fit(years)
-    
-    # Store globally
-    global_year_scaler = scaler
-    
-    return scaler
+    if len(years) > 0:
+        scaler = StandardScaler()
+        years_array = np.array(years).reshape(-1, 1)
+        scaler.fit(years_array)
+        return scaler
+    return None
 
 def generate_node_features_for_new_paper(paper_json, G, metadata=None, normalize_year=True):
     """
-    Generate node features for a new paper in the same format as the existing graph.
-    
-    Args:
-        paper_json: Dictionary containing paper information
-        G: NetworkX graph with existing papers
-        metadata: Dictionary of paper metadata (optional)
-        normalize_year: Whether to normalize the year feature
-        
-    Returns:
-        Tuple of (node_id, node_features, paper_metadata)
+    Generate node features for a new paper (inductive setting).
+    Now focuses on basic features since SciBERT similarity is moved to edge features.
     """
-    # Extract paper information
+    # Extract basic information
     title = paper_json.get('title', '')
-    year = paper_json.get('published_date', '').split('-')[0]
-    journal = paper_json.get('journal', '')
+    year_str = paper_json.get('published_date', '').split('-')[0]
+    year = int(year_str) if year_str.isdigit() else 2020  # Default to 2020
     authors = paper_json.get('authors', [])
-    abstract = paper_json.get('abstract', '')
-    
-    # Format authors
-    formatted_authors = format_authors(authors)
+    journal = paper_json.get('journal', '')
     
     # Create paper ID
-    paper_id = get_paper_id(title, authors, year)
+    paper_id = get_paper_id(title, authors, year_str)
     
-    # Generate SciBERT embedding with PCA reduction
-    text_to_embed = get_text_to_embed(title, abstract)
-    scibert_embedding = generate_scibert_embedding(text_to_embed)
+    # Format authors
+    formatted_authors = []
+    for author in authors:
+        formatted_name = format_author_name(author)
+        if formatted_name:
+            formatted_authors.append(formatted_name)
     
     # Get journal encoding
-    journal_encoding = get_journal_encoding(journal)
-    
-    # Convert year to int if possible
-    if isinstance(year, str) and year.isdigit():
-        year = int(year)
-    else:
-        year = 0
+    journal_name = standardize_journal_name(journal)
+    journal_encoding = get_journal_encoding(journal_name)
     
     # Normalize year if requested
-    if normalize_year and global_year_scaler is None and G:
-        create_year_scaler(G)
+    year_feature = year
+    if normalize_year:
+        year_scaler = create_year_scaler(G)
+        if year_scaler:
+            year_feature = year_scaler.transform([[year]])[0][0]
+        else:
+            # Fallback normalization
+            years = [G.nodes[node].get('year', 2020) for node in G.nodes()]
+            valid_years = [y for y in years if y > 0]
+            if valid_years:
+                mean_year = np.mean(valid_years)
+                std_year = np.std(valid_years)
+                if std_year > 0:
+                    year_feature = (year - mean_year) / std_year
     
-    if normalize_year and global_year_scaler is not None:
-        normalized_year = global_year_scaler.transform([[year]])[0][0]
-    else:
-        normalized_year = year
+    # Count features (basic graph statistics)
+    num_authors = len(formatted_authors)
     
-    # Create is_main_article flag (new papers are main articles)
-    is_main_article = True
+    # Create feature vector: [year, journal_encoding (8 dims), num_authors, is_main_article]
+    features = [year_feature] + journal_encoding + [num_authors, 1.0]  # 1.0 for is_main_article
     
-    # Create features array
-    features = np.concatenate([
-        np.array([normalized_year]).reshape(1),  # Year (normalized)
-        np.array(journal_encoding),              # Journal encoding
-        scibert_embedding,                       # SciBERT embedding (PCA-reduced)
-        np.array([1 if is_main_article else 0])  # Is main article
-    ])
-    
-    # Create metadata dictionary
+    # Paper metadata
     paper_metadata = {
-        'id': paper_id,
         'title': title,
-        'year': year,
-        'journal': journal,
-        'authors': formatted_authors,
-        'is_main_article': is_main_article
+        'journal': journal_name or '',
+        'authors': "; ".join(formatted_authors),
+        'is_main_article': True,
+        'year': year
     }
     
     return paper_id, features, paper_metadata
 
-def add_paper_to_graph(paper_json, G, metadata, paper_id=None, features=None, paper_metadata=None):
+class GraphSAGECitationModel(nn.Module):
     """
-    Add a new paper to the existing graph without retraining.
+    GraphSAGE-based citation recommendation model.
     
-    Args:
-        paper_json: Dictionary containing paper information
-        G: NetworkX graph with existing papers
-        metadata: Dictionary of paper metadata
-        paper_id: ID of the paper (optional, generated if not provided)
-        features: Pre-computed features (optional)
-        paper_metadata: Pre-computed metadata (optional)
+    This model uses GraphSAGE to learn node representations from graph structure,
+    then combines them with edge features (including SciBERT cosine similarity)
+    for citation prediction.
+    """
+    
+    def __init__(self, input_dim, hidden_dim=128, num_layers=2, edge_feature_dim=6, 
+                 aggregator='mean', dropout=0.2):
+        super(GraphSAGECitationModel, self).__init__()
         
-    Returns:
-        Updated graph and metadata
-    """
-    # Generate features if not provided
-    if paper_id is None or features is None or paper_metadata is None:
-        paper_id, features, paper_metadata = generate_node_features_for_new_paper(paper_json, G, metadata)
-    
-    # Check if paper already exists in graph
-    if paper_id in G:
-        print(f"Warning: Paper '{paper_id}' already exists in graph")
-        return G, metadata
-    
-    # Add node to graph
-    G.add_node(
-        paper_id,
-        year=paper_metadata['year'],
-        journal_encoding=paper_metadata.get('journal_encoding', [0] * 8),  # Default encoding
-        scibert_embedding=features[1+8:-1],  # Extract embedding from features
-        is_main_article=paper_metadata['is_main_article']
-    )
-    
-    # Add to metadata
-    metadata[paper_id] = paper_metadata
-    
-    # Extract references from paper_json
-    references = paper_json.get('references', [])
-    
-    # Add citation edges
-    for ref in references:
-        if ref.get('reference_type') != 'article':
-            continue
-            
-        ref_title = ref.get('title')
-        if not ref_title or should_filter_title(ref_title):
-            continue
-            
-        ref_id = get_paper_id(
-            ref_title,
-            ref.get('authors', []),
-            str(ref.get('year', ''))
+        self.num_layers = num_layers
+        self.hidden_dim = hidden_dim
+        self.dropout = dropout
+        
+        # GraphSAGE layers
+        self.sage_layers = nn.ModuleList()
+        
+        # First layer
+        self.sage_layers.append(SAGEConv(input_dim, hidden_dim, aggr=aggregator))
+        
+        # Additional layers
+        for _ in range(num_layers - 1):
+            self.sage_layers.append(SAGEConv(hidden_dim, hidden_dim, aggr=aggregator))
+        
+        # Edge feature processing
+        self.edge_processor = nn.Sequential(
+            nn.Linear(edge_feature_dim, hidden_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(dropout)
         )
         
-        if ref_id and ref_id in G:
-            G.add_edge(paper_id, ref_id)
+        # Final prediction layers
+        self.predictor = nn.Sequential(
+            nn.Linear(2 * hidden_dim + hidden_dim // 2, hidden_dim),
+            nn.ReLU(),
+            nn.BatchNorm1d(hidden_dim),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim // 2, 1),
+            nn.Sigmoid()
+        )
     
-    return G, metadata
+    def forward(self, x, edge_index, src_nodes, tgt_nodes, edge_features):
+        """
+        Forward pass of the model.
+        
+        Args:
+            x: Node features [num_nodes, input_dim]
+            edge_index: Edge connectivity [2, num_edges]
+            src_nodes: Source node indices [batch_size]
+            tgt_nodes: Target node indices [batch_size]
+            edge_features: Edge features [batch_size, edge_feature_dim]
+        
+        Returns:
+            Citation predictions [batch_size, 1]
+        """
+        # Apply GraphSAGE layers
+        h = x
+        for i, layer in enumerate(self.sage_layers):
+            h = layer(h, edge_index)
+            if i < len(self.sage_layers) - 1:  # Don't apply activation after last layer
+                h = F.relu(h)
+                h = F.dropout(h, p=self.dropout, training=self.training)
+        
+        # Get embeddings for source and target nodes
+        src_embeddings = h[src_nodes]  # [batch_size, hidden_dim]
+        tgt_embeddings = h[tgt_nodes]  # [batch_size, hidden_dim]
+        
+        # Process edge features
+        edge_processed = self.edge_processor(edge_features)  # [batch_size, hidden_dim // 2]
+        
+        # Combine all features
+        combined = torch.cat([src_embeddings, tgt_embeddings, edge_processed], dim=1)
+        
+        # Make prediction
+        return self.predictor(combined)
 
-def inductive_recommend_citations(paper_json, G, metadata, model, node_features, 
-                                node_mapping, reverse_mapping, author_coauthor_G=None, 
-                                top_k=10, exclude_observed=True, device='cpu', include_feature_importance=False):
+def extract_edge_features(source_id, target_id, G, metadata, paper_embeddings_dict, 
+                         author_coauthor_G=None, observed_citations_only=False, 
+                         observed_citations=None):
     """
-    Recommend citations for a new paper in an inductive setting.
+    Extract edge features including SciBERT cosine similarity.
     
     Args:
-        paper_json: Dictionary containing paper information
-        G: NetworkX graph with existing papers
+        source_id: ID of the source paper
+        target_id: ID of the target paper
+        G: NetworkX graph
         metadata: Dictionary of paper metadata
-        model: Trained EnhancedCitationMLP model
-        node_features: Node features tensor for existing papers
-        node_mapping: Mapping from node IDs to indices
-        reverse_mapping: Mapping from indices to node IDs
+        paper_embeddings_dict: Dictionary mapping paper titles to SciBERT embeddings
         author_coauthor_G: Author co-authorship graph (optional)
-        top_k: Number of top recommendations to return
-        exclude_observed: Whether to exclude observed citations from recommendations
-        device: Device to run the model on
-        include_feature_importance: Whether to include feature importance analysis
+        observed_citations_only: Whether to use only observed citations
+        observed_citations: List of observed citation IDs
         
     Returns:
-        List of dictionaries containing recommended citations
+        Dictionary of edge features
     """
+    features = {}
+    
+    # Get metadata for both papers
+    source_metadata = metadata.get(source_id, {})
+    target_metadata = metadata.get(target_id, {})
+    
+    # 1. SciBERT cosine similarity (NEW - main semantic feature)
+    source_title = source_metadata.get('title', '')
+    target_title = target_metadata.get('title', '')
+    
+    source_embedding = paper_embeddings_dict.get(source_title, [])
+    target_embedding = paper_embeddings_dict.get(target_title, [])
+    
+    cosine_sim = calculate_cosine_similarity(source_embedding, target_embedding)
+    features['scibert_cosine_similarity'] = cosine_sim
+    
+    # 2. Number of shared authors
+    authors1 = set(source_metadata.get('authors', '').split('; '))
+    authors2 = set(target_metadata.get('authors', '').split('; '))
+    shared_authors = len(authors1.intersection(authors2))
+    features['shared_authors'] = shared_authors
+    
+    # 3. Number of shared citations
+    if observed_citations_only and observed_citations is not None:
+        citations1 = set(observed_citations)
+    else:
+        citations1 = set(G.successors(source_id)) if source_id in G else set()
+    
+    citations2 = set(G.successors(target_id)) if target_id in G else set()
+    shared_citations = len(citations1.intersection(citations2))
+    features['shared_citations'] = shared_citations
+    
+    # 4. Journal similarity (same journal = 1, different = 0)
+    source_journal = source_metadata.get('journal', '')
+    target_journal = target_metadata.get('journal', '')
+    journal_match = 1.0 if source_journal and target_journal and source_journal == target_journal else 0.0
+    features['journal_match'] = journal_match
+    
+    # 5. Year difference (normalized)
+    source_year = source_metadata.get('year', 2020)
+    target_year = target_metadata.get('year', 2020)
+    year_diff = abs(source_year - target_year) / 50.0  # Normalize by 50 years
+    features['year_difference'] = min(year_diff, 1.0)  # Cap at 1.0
+    
+    # 6. Observed citation context (for partial citation prediction)
+    if observed_citations_only and observed_citations is not None:
+        target_citations = set(G.predecessors(target_id)) if target_id in G else set()
+        observed_citing_target = len([c for c in observed_citations if c in target_citations])
+        features['observed_citing_target'] = observed_citing_target / max(len(observed_citations), 1)
+    else:
+        features['observed_citing_target'] = 0.0
+    
+    return features
+
+def load_articles(articles_file='articles.jsonl'):
+    """Load articles from a JSONL file."""
+    print(f"Loading articles from {articles_file}...")
+    with open(articles_file, 'r') as f:
+        articles = [json.loads(line) for line in f]
+    print(f"Loaded {len(articles)} articles")
+    return articles
+
+def build_gnn_graph(articles, embedding_file='embeddings/papers_with_embeddings.pkl'):
+    """
+    Build a graph for GraphSAGE-based citation recommendation.
+    Node features now exclude SciBERT embeddings (moved to edge features).
+    """
+    print("Building GraphSAGE citation graph...")
+    
+    # Load paper embeddings for edge features
+    paper_embeddings_dict = load_paper_embeddings(embedding_file)
+    
+    # Create directed graph
+    G = nx.DiGraph()
+    metadata = {}
+    main_article_count = 0
+    
+    # First pass: Add all nodes with basic features
+    print("Adding nodes with basic features...")
+    for article in tqdm(articles):
+        if not article.get('title') or not article.get('published_date') or not article.get('authors'):
+            continue
+            
+        if should_filter_title(article.get('title', '')):
+            continue
+            
+        title = article['title']
+        year = article['published_date'].split('-')[0]
+        authors = article.get('authors', [])
+        
+        article_id = get_paper_id(title, authors, year)
+        if not article_id:
+            continue
+            
+        # Format authors
+        formatted_authors = []
+        for author in authors:
+            formatted_name = format_author_name(author)
+            if formatted_name:
+                formatted_authors.append(formatted_name)
+        
+        # Get journal encoding
+        journal_name = standardize_journal_name(article.get('journal', ''))
+        journal_encoding = get_journal_encoding(journal_name)
+        
+        # Create basic node features: [year, journal_encoding (8), num_authors, is_main_article]
+        year_int = int(year) if year.isdigit() else 2020
+        num_authors = len(formatted_authors)
+        node_features = [year_int] + journal_encoding + [num_authors, 1.0]  # is_main_article = 1
+        
+        G.add_node(article_id, features=node_features, year=year_int)
+        
+        metadata[article_id] = {
+            'title': title,
+            'journal': journal_name or '',
+            'authors': "; ".join(formatted_authors),
+            'is_main_article': True,
+            'year': year_int
+        }
+        
+        main_article_count += 1
+        
+        # Process references
+        if 'references' in article:
+            for ref in article['references']:
+                if ref.get('reference_type') != 'article':
+                    continue
+                    
+                ref_title = ref.get('title')
+                if not ref_title or should_filter_title(ref_title):
+                    continue
+                    
+                ref_id = get_paper_id(
+                    ref_title,
+                    ref.get('authors', []),
+                    str(ref.get('year', ''))
+                )
+                
+                if ref_id:
+                    # Add reference node if not exists
+                    if ref_id not in G:
+                        ref_formatted_authors = []
+                        ref_authors = ref.get('authors', [])
+                        for author in ref_authors:
+                            formatted_name = format_author_name(author)
+                            if formatted_name:
+                                ref_formatted_authors.append(formatted_name)
+                        
+                        ref_journal_name = standardize_journal_name(ref.get('journal', ''))
+                        ref_journal_encoding = get_journal_encoding(ref_journal_name)
+                        
+                        ref_year = ref.get('year', '')
+                        ref_year_int = int(ref_year) if str(ref_year).isdigit() else 2020
+                        ref_num_authors = len(ref_formatted_authors)
+                        
+                        ref_node_features = [ref_year_int] + ref_journal_encoding + [ref_num_authors, 0.0]  # is_main_article = 0
+                        
+                        G.add_node(ref_id, features=ref_node_features, year=ref_year_int)
+                        
+                        metadata[ref_id] = {
+                            'title': ref_title,
+                            'journal': ref_journal_name or '',
+                            'authors': "; ".join(ref_formatted_authors),
+                            'is_main_article': False,
+                            'year': ref_year_int
+                        }
+                    
+                    # Add citation edge
+                    G.add_edge(article_id, ref_id)
+    
+    # Normalize year features
+    print("Normalizing year features...")
+    year_scaler = create_year_scaler(G)
+    if year_scaler:
+        for node_id in G.nodes():
+            features = G.nodes[node_id]['features']
+            year = features[0]
+            normalized_year = year_scaler.transform([[year]])[0][0]
+            features[0] = normalized_year
+            G.nodes[node_id]['features'] = features
+    
+    print(f"Created GraphSAGE citation graph with {G.number_of_nodes()} nodes and {G.number_of_edges()} edges")
+    print(f"Processed {main_article_count} main articles")
+    
+    return G, metadata, main_article_count, paper_embeddings_dict
+
+def convert_to_pytorch_geometric(G, metadata):
+    """Convert NetworkX graph to PyTorch Geometric format for GraphSAGE."""
+    print("Converting to PyTorch Geometric format...")
+    
+    # Create node mapping
+    node_ids = list(G.nodes())
+    node_mapping = {node_id: i for i, node_id in enumerate(node_ids)}
+    
+    # Extract node features
+    node_features = []
+    for node_id in node_ids:
+        features = G.nodes[node_id]['features']
+        node_features.append(features)
+    
+    # Convert to tensor
+    node_features_tensor = torch.tensor(node_features, dtype=torch.float)
+    
+    # Create edge index
+    edges = list(G.edges())
+    edge_index = torch.tensor([[node_mapping[src], node_mapping[dst]] for src, dst in edges], 
+                             dtype=torch.long).t().contiguous()
+    
+    # Create PyTorch Geometric Data object
+    data = Data(x=node_features_tensor, edge_index=edge_index)
+    data.node_mapping = node_mapping
+    data.reverse_mapping = {i: node_id for node_id, i in node_mapping.items()}
+    
+    print(f"Created PyTorch Geometric Data with {data.num_nodes} nodes and {data.num_edges} edges")
+    print(f"Node feature dimensions: {data.num_node_features}")
+    
+    return data
+
+def prepare_citation_prediction_data(G, metadata, paper_embeddings_dict, author_coauthor_G=None, 
+                                   split_ratio=0.8, random_seed=42):
+    """Prepare data for citation prediction with GraphSAGE."""
+    random.seed(random_seed)
+    np.random.seed(random_seed)
+    
+    main_articles = [node for node in G.nodes() if metadata[node].get('is_main_article', True)]
+    print(f"Found {len(main_articles)} main articles")
+    
+    positive_examples = []
+    negative_examples = []
+    
+    for main_article in tqdm(main_articles, desc="Creating citation examples"):
+        cited_papers = list(G.successors(main_article))
+        
+        # Positive examples
+        for cited_paper in cited_papers:
+            edge_features = extract_edge_features(
+                main_article, cited_paper, G, metadata, paper_embeddings_dict, author_coauthor_G
+            )
+            positive_examples.append((main_article, cited_paper, 1, edge_features))
+        
+        # Negative examples
+        all_papers = list(G.nodes())
+        non_cited_papers = [p for p in all_papers if p != main_article and p not in cited_papers]
+        
+        num_negative_samples = min(len(non_cited_papers), 3 * len(cited_papers))
+        if len(non_cited_papers) > num_negative_samples:
+            non_cited_papers = random.sample(non_cited_papers, num_negative_samples)
+        
+        for non_cited_paper in non_cited_papers:
+            edge_features = extract_edge_features(
+                main_article, non_cited_paper, G, metadata, paper_embeddings_dict, author_coauthor_G
+            )
+            negative_examples.append((main_article, non_cited_paper, 0, edge_features))
+    
+    print(f"Created {len(positive_examples)} positive and {len(negative_examples)} negative examples")
+    
+    # Combine and shuffle
+    all_examples = positive_examples + negative_examples
+    random.shuffle(all_examples)
+    
+    # Split data
+    split_idx = int(len(all_examples) * split_ratio)
+    train_examples = all_examples[:split_idx]
+    test_examples = all_examples[split_idx:]
+    
+    # Create node mapping
+    node_ids = list(G.nodes())
+    node_mapping = {node_id: i for i, node_id in enumerate(node_ids)}
+    
+    # Convert to tensors
+    def examples_to_tensors(examples):
+        source_nodes = [node_mapping[src] for src, _, _, _ in examples]
+        target_nodes = [node_mapping[dst] for _, dst, _, _ in examples]
+        labels = [label for _, _, label, _ in examples]
+        edge_features = [list(features.values()) for _, _, _, features in examples]
+        
+        return {
+            'source_nodes': torch.tensor(source_nodes, dtype=torch.long),
+            'target_nodes': torch.tensor(target_nodes, dtype=torch.long),
+            'labels': torch.tensor(labels, dtype=torch.float),
+            'edge_features': torch.tensor(edge_features, dtype=torch.float),
+            'examples': examples
+        }
+    
+    train_data = examples_to_tensors(train_examples)
+    test_data = examples_to_tensors(test_examples)
+    
+    # Get edge feature names
+    edge_feature_names = list(train_examples[0][3].keys()) if train_examples else []
+    
+    return {
+        'train': train_data,
+        'test': test_data,
+        'node_mapping': node_mapping,
+        'reverse_mapping': {i: node_id for node_id, i in node_mapping.items()},
+        'edge_feature_names': edge_feature_names
+    }
+
+def clear_cache(cache_dir='cache_gnn'):
+    """Clear all cached files."""
+    import shutil
+    if os.path.exists(cache_dir):
+        print(f"Clearing cache directory: {cache_dir}")
+        shutil.rmtree(cache_dir)
+        print("Cache cleared successfully")
+    else:
+        print("Cache directory does not exist")
+
+def get_cache_status(cache_dir='cache_gnn'):
+    """Check which cache files exist and their sizes."""
+    cache_files = [
+        'articles.pkl',
+        'gnn_citation_graph.gpickle',
+        'gnn_paper_metadata.json',
+        'paper_embeddings_dict.pkl',
+        'gnn_data.pt',
+        'citation_prediction_data.pt',
+        'graphsage_citation_model.pt',
+        'training_history.pkl'
+    ]
+    
+    print("Cache status:")
+    if not os.path.exists(cache_dir):
+        print(f"  Cache directory '{cache_dir}' does not exist")
+        return
+    
+    for filename in cache_files:
+        filepath = os.path.join(cache_dir, filename)
+        if os.path.exists(filepath):
+            size_mb = os.path.getsize(filepath) / (1024 * 1024)
+            print(f"  ✓ {filename} ({size_mb:.1f} MB)")
+        else:
+            print(f"  ✗ {filename}")
+
+def optimize_batch_size_for_gpu(data, citation_data, device='cuda', start_batch_size=64):
+    """Automatically find the optimal batch size for the available GPU memory."""
+    if device == 'cpu':
+        return min(start_batch_size * 2, 512)  # Larger batches for CPU
+    
+    if not torch.cuda.is_available():
+        return start_batch_size
+    
+    print("Finding optimal batch size for GPU...")
+    
+    # Get GPU memory info
+    torch.cuda.empty_cache()
+    total_memory = torch.cuda.get_device_properties(0).total_memory
+    print(f"Total GPU memory: {total_memory / 1024**3:.1f} GB")
+    
+    # Test different batch sizes
+    input_dim = data.num_node_features
+    edge_feature_dim = citation_data['train']['edge_features'].shape[1]
+    
+    model = GraphSAGECitationModel(
+        input_dim=input_dim,
+        hidden_dim=128,
+        num_layers=2,
+        edge_feature_dim=edge_feature_dim,
+        dropout=0.2
+    ).to(device)
+    
+    data = data.to(device)
+    criterion = nn.BCELoss()
+    
+    batch_size = start_batch_size
+    max_batch_size = start_batch_size
+    
+    while batch_size <= 2048:  # Don't go too high
+        try:
+            torch.cuda.empty_cache()
+            
+            # Create dummy batch
+            train_data = citation_data['train']
+            if len(train_data['source_nodes']) < batch_size:
+                break
+                
+            batch_src = train_data['source_nodes'][:batch_size].to(device)
+            batch_tgt = train_data['target_nodes'][:batch_size].to(device)
+            batch_edge = train_data['edge_features'][:batch_size].to(device)
+            batch_labels = train_data['labels'][:batch_size].to(device)
+            
+            # Forward pass
+            outputs = model(data.x, data.edge_index, batch_src, batch_tgt, batch_edge)
+            loss = criterion(outputs.squeeze(), batch_labels)
+            
+            # Backward pass
+            loss.backward()
+            
+            max_batch_size = batch_size
+            print(f"Batch size {batch_size}: OK")
+            batch_size *= 2
+            
+        except RuntimeError as e:
+            if "out of memory" in str(e):
+                print(f"Batch size {batch_size}: Out of memory")
+                break
+            else:
+                raise e
+    
+    # Clean up
+    del model
+    torch.cuda.empty_cache()
+    
+    print(f"Optimal batch size: {max_batch_size}")
+    return max_batch_size
+
+def train_graphsage_model(data, citation_data, device='cuda', batch_size=64, epochs=50, lr=0.001, 
+                         save_checkpoints=True, checkpoint_every=5, optimize_batch_size=True,
+                         use_mixed_precision=True, gradient_accumulation_steps=1, 
+                         num_workers=12, pin_memory=True):
+    """
+    Train the GraphSAGE citation model with comprehensive optimizations.
+    
+    Args:
+        optimize_batch_size: Automatically find optimal batch size for GPU
+        use_mixed_precision: Use automatic mixed precision training (faster on modern GPUs)
+        gradient_accumulation_steps: Accumulate gradients over multiple batches
+        num_workers: Number of workers for data loading
+        pin_memory: Use pinned memory for faster GPU transfer
+    """
+    if device == 'cuda' and not torch.cuda.is_available():
+        print("CUDA not available, using CPU")
+        device = 'cpu'
+        use_mixed_precision = False  # Mixed precision only works on GPU
+    
+    # Optimize batch size if requested
+    if optimize_batch_size and device == 'cuda':
+        batch_size = optimize_batch_size_for_gpu(data, citation_data, device, batch_size)
+    
+    # Adjust num_workers for CPU vs GPU
+    if device == 'cpu':
+        import multiprocessing
+        num_workers = min(num_workers, multiprocessing.cpu_count())
+    else:
+        num_workers = min(num_workers, 12)  # Use up to 12 workers for GPU systems
+    
+    print(f"Training configuration:")
+    print(f"  Device: {device}")
+    print(f"  Batch size: {batch_size}")
+    print(f"  Mixed precision: {use_mixed_precision}")
+    print(f"  Gradient accumulation steps: {gradient_accumulation_steps}")
+    print(f"  Data loading workers: {num_workers}")
+    print(f"  Pin memory: {pin_memory}")
+    
+    # Move data to device
+    data = data.to(device)
+    
+    # Get dimensions
+    input_dim = data.num_node_features
+    edge_feature_dim = citation_data['train']['edge_features'].shape[1]
+    
+    # Initialize model with optimizations
+    model = GraphSAGECitationModel(
+        input_dim=input_dim,
+        hidden_dim=128,
+        num_layers=2,
+        edge_feature_dim=edge_feature_dim,
+        dropout=0.2
+    ).to(device)
+    
+    # Enable compilation for PyTorch 2.0+ (significant speedup)
+    if hasattr(torch, 'compile') and device == 'cuda':
+        print("Compiling model with torch.compile for additional speedup...")
+        model = torch.compile(model)
+    
+    # Loss and optimizer with improved settings
+    criterion = nn.BCELoss()
+    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-5, eps=1e-8)
+    
+    # Learning rate scheduler
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.5, patience=5, verbose=True
+    )
+    
+    # Mixed precision scaler
+    scaler = torch.cuda.amp.GradScaler() if use_mixed_precision else None
+    
+    # Training data with optimized DataLoader
+    train_data = citation_data['train']
+    train_dataset = TensorDataset(
+        train_data['source_nodes'],
+        train_data['target_nodes'],
+        train_data['edge_features'],
+        train_data['labels']
+    )
+    
+    train_loader = DataLoader(
+        train_dataset, 
+        batch_size=batch_size, 
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=pin_memory and device == 'cuda',
+        drop_last=True,  # Avoid issues with batch norm on small final batches
+        persistent_workers=num_workers > 0  # Keep workers alive between epochs
+    )
+    
+    # Training history with more metrics
+    history = {
+        'loss': [], 'val_loss': [], 'val_auc': [], 
+        'learning_rate': [], 'epoch_time': [], 'batch_time': []
+    }
+    
+    # Create checkpoint directory
+    if save_checkpoints:
+        os.makedirs('cache_gnn/checkpoints', exist_ok=True)
+    
+    print(f"Training GraphSAGE model for {epochs} epochs...")
+    print(f"Training batches per epoch: {len(train_loader)}")
+    
+    # Training loop with optimizations
+    best_val_auc = 0
+    start_time = time.time()
+    
+    for epoch in range(epochs):
+        epoch_start_time = time.time()
+        model.train()
+        total_loss = 0
+        batch_times = []
+        
+        progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}")
+        
+        for batch_idx, (batch_src, batch_tgt, batch_edge, batch_labels) in enumerate(progress_bar):
+            batch_start_time = time.time()
+            
+            batch_src = batch_src.to(device, non_blocking=True)
+            batch_tgt = batch_tgt.to(device, non_blocking=True)
+            batch_edge = batch_edge.to(device, non_blocking=True)
+            batch_labels = batch_labels.to(device, non_blocking=True)
+            
+            # Mixed precision forward pass
+            if use_mixed_precision:
+                with torch.cuda.amp.autocast():
+                    outputs = model(data.x, data.edge_index, batch_src, batch_tgt, batch_edge)
+                    loss = criterion(outputs.squeeze(), batch_labels)
+                    loss = loss / gradient_accumulation_steps  # Scale loss for gradient accumulation
+            else:
+                outputs = model(data.x, data.edge_index, batch_src, batch_tgt, batch_edge)
+                loss = criterion(outputs.squeeze(), batch_labels)
+                loss = loss / gradient_accumulation_steps
+            
+            # Backward pass with gradient accumulation
+            if use_mixed_precision:
+                scaler.scale(loss).backward()
+            else:
+                loss.backward()
+            
+            # Optimizer step with gradient accumulation
+            if (batch_idx + 1) % gradient_accumulation_steps == 0:
+                if use_mixed_precision:
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    # Gradient clipping for stability
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    optimizer.step()
+                
+                optimizer.zero_grad()
+            
+            total_loss += loss.item() * gradient_accumulation_steps
+            
+            # Track timing
+            batch_time = time.time() - batch_start_time
+            batch_times.append(batch_time)
+            
+            # Update progress bar
+            avg_batch_time = np.mean(batch_times[-10:])  # Moving average of last 10 batches
+            progress_bar.set_postfix({
+                'loss': total_loss / (batch_idx + 1),
+                'batch_time': f'{avg_batch_time:.3f}s',
+                'lr': f'{optimizer.param_groups[0]["lr"]:.2e}'
+            })
+        
+        # Epoch metrics
+        avg_loss = total_loss / len(train_loader)
+        epoch_time = time.time() - epoch_start_time
+        avg_batch_time = np.mean(batch_times)
+        
+        history['loss'].append(avg_loss)
+        history['learning_rate'].append(optimizer.param_groups[0]['lr'])
+        history['epoch_time'].append(epoch_time)
+        history['batch_time'].append(avg_batch_time)
+        
+        # Evaluate with optimized batch size
+        eval_batch_size = min(batch_size * 2, 1024)  # Larger batch for evaluation
+        val_metrics = evaluate_graphsage_model(model, data, citation_data, device, eval_batch_size)
+        history['val_loss'].append(val_metrics['loss'])
+        history['val_auc'].append(val_metrics['auc'])
+        
+        # Learning rate scheduling
+        scheduler.step(val_metrics['loss'])
+        
+        # Save best model
+        if val_metrics['auc'] > best_val_auc:
+            best_val_auc = val_metrics['auc']
+            if save_checkpoints:
+                best_model_path = 'cache_gnn/best_graphsage_model.pt'
+                torch.save(model.state_dict(), best_model_path)
+        
+        print(f"Epoch {epoch+1}/{epochs}:")
+        print(f"  Loss: {avg_loss:.4f} | Val Loss: {val_metrics['loss']:.4f} | Val AUC: {val_metrics['auc']:.4f}")
+        print(f"  Epoch time: {epoch_time:.1f}s | Avg batch time: {avg_batch_time:.3f}s")
+        print(f"  Learning rate: {optimizer.param_groups[0]['lr']:.2e}")
+        
+        # Save checkpoint
+        if save_checkpoints and (epoch + 1) % checkpoint_every == 0:
+            checkpoint_path = f'cache_gnn/checkpoints/model_epoch_{epoch+1}.pt'
+            torch.save({
+                'epoch': epoch + 1,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
+                'scaler_state_dict': scaler.state_dict() if scaler else None,
+                'loss': avg_loss,
+                'val_auc': val_metrics['auc'],
+                'history': history
+            }, checkpoint_path)
+            print(f"Checkpoint saved: {checkpoint_path}")
+    
+    total_time = time.time() - start_time
+    print(f"\nTraining completed in {total_time:.1f}s ({total_time/60:.1f} minutes)")
+    print(f"Best validation AUC: {best_val_auc:.4f}")
+    
+    return model, history
+
+def evaluate_graphsage_model(model, data, citation_data, device='cuda', batch_size=64, 
+                           num_workers=12, pin_memory=True):
+    """Evaluate the GraphSAGE model with optimized data loading."""
+    model.eval()
+    
+    # Adjust num_workers for evaluation
+    if device == 'cpu':
+        import multiprocessing
+        num_workers = min(num_workers, multiprocessing.cpu_count())
+    else:
+        num_workers = min(num_workers, 8)  # Use up to 8 workers for evaluation (lighter load)
+    
+    # Test data with optimized DataLoader
+    test_data = citation_data['test']
+    test_dataset = TensorDataset(
+        test_data['source_nodes'],
+        test_data['target_nodes'],
+        test_data['edge_features'],
+        test_data['labels']
+    )
+    test_loader = DataLoader(
+        test_dataset, 
+        batch_size=batch_size,
+        num_workers=num_workers,
+        pin_memory=pin_memory and device == 'cuda',
+        persistent_workers=num_workers > 0
+    )
+    
+    criterion = nn.BCELoss()
+    
+    total_loss = 0
+    all_preds = []
+    all_probs = []
+    all_labels = []
+    
+    with torch.no_grad():
+        for batch_src, batch_tgt, batch_edge, batch_labels in test_loader:
+            batch_src = batch_src.to(device, non_blocking=True)
+            batch_tgt = batch_tgt.to(device, non_blocking=True)
+            batch_edge = batch_edge.to(device, non_blocking=True)
+            batch_labels = batch_labels.to(device, non_blocking=True)
+            
+            outputs = model(data.x, data.edge_index, batch_src, batch_tgt, batch_edge)
+            loss = criterion(outputs.squeeze(), batch_labels)
+            
+            total_loss += loss.item()
+            
+            probs = outputs.squeeze().cpu().numpy()
+            preds = (probs > 0.5).astype(int)
+            labels = batch_labels.cpu().numpy()
+            
+            all_probs.extend(probs)
+            all_preds.extend(preds)
+            all_labels.extend(labels)
+    
+    # Calculate metrics
+    avg_loss = total_loss / len(test_loader)
+    accuracy = accuracy_score(all_labels, all_preds)
+    precision = precision_score(all_labels, all_preds, zero_division=0)
+    recall = recall_score(all_labels, all_preds, zero_division=0)
+    f1 = f1_score(all_labels, all_preds, zero_division=0)
+    auc = roc_auc_score(all_labels, all_probs) if len(set(all_labels)) > 1 else 0
+    
+    return {
+        'loss': avg_loss,
+        'accuracy': accuracy,
+        'precision': precision,
+        'recall': recall,
+        'f1': f1,
+        'auc': auc
+    }
+
+def inductive_recommend_citations(paper_json, G, metadata, model, data, paper_embeddings_dict,
+                                author_coauthor_G=None, top_k=10, exclude_observed=True, 
+                                device='cpu', include_feature_importance=False):
+    """Recommend citations for a new paper using GraphSAGE (inductive setting)."""
+    # Generate features for new paper
+    paper_id, paper_features, paper_metadata = generate_node_features_for_new_paper(paper_json, G, metadata)
+    
     # Extract observed citations
     observed_citations = []
     for ref in paper_json.get('references', []):
@@ -346,139 +982,85 @@ def inductive_recommend_citations(paper_json, G, metadata, model, node_features,
         if ref_id and ref_id in G:
             observed_citations.append(ref_id)
     
-    # Generate features for the new paper
-    paper_id, paper_features, paper_metadata = generate_node_features_for_new_paper(paper_json, G, metadata)
-    
-    # Move model to device
-    model = model.to(device)
-    
-    # Get candidate papers (all papers except the observed citations)
+    # Get candidates
     candidates = [node for node in G.nodes()]
-    
-    # Exclude observed citations if requested
     if exclude_observed:
         candidates = [c for c in candidates if c not in observed_citations]
     
-    # Convert paper features to tensor
-    paper_features_tensor = torch.tensor(paper_features, dtype=torch.float).to(device)
+    # Create temporary extended graph with new paper
+    extended_data = data.clone()
     
-    # Prepare batches for prediction
+    # Add new paper features to node features
+    new_node_features = torch.cat([
+        extended_data.x,
+        torch.tensor([paper_features], dtype=torch.float).to(device)
+    ], dim=0)
+    
+    extended_data.x = new_node_features
+    new_node_idx = len(data.node_mapping)
+    
+    # Move model and data to device
+    model = model.to(device)
+    extended_data = extended_data.to(device)
+    
+    # Batch prediction
     batch_size = 1000
     all_probs = []
     all_edge_features = []
     
-    # Process candidates in batches
     for i in range(0, len(candidates), batch_size):
         batch_candidates = candidates[i:i+batch_size]
-        batch_idxs = [node_mapping[c] for c in batch_candidates]
+        batch_tgt_idxs = [data.node_mapping[c] for c in batch_candidates]
         
-        # Get source embeddings (repeated for each candidate)
-        src_embeddings = paper_features_tensor.repeat(len(batch_candidates), 1)
-        
-        # Get target embeddings
-        tgt_embeddings = node_features[torch.tensor(batch_idxs, dtype=torch.long).to(device)]
-        
-        # Extract edge features for each candidate
+        # Extract edge features
         edge_features = []
         for candidate in batch_candidates:
             features = extract_edge_features(
-                paper_id, 
-                candidate, 
-                G, 
-                metadata, 
-                author_coauthor_G,
-                observed_citations_only=True,
+                paper_id, candidate, G, metadata, paper_embeddings_dict,
+                author_coauthor_G, observed_citations_only=True, 
                 observed_citations=observed_citations
             )
             edge_features.append(list(features.values()))
         
-        # Convert edge features to tensor
-        edge_features_tensor = torch.tensor(edge_features, dtype=torch.float).to(device)
         all_edge_features.extend(edge_features)
         
-        # Get predictions
+        # Create tensors
+        src_tensor = torch.tensor([new_node_idx] * len(batch_candidates), dtype=torch.long).to(device)
+        tgt_tensor = torch.tensor(batch_tgt_idxs, dtype=torch.long).to(device)
+        edge_tensor = torch.tensor(edge_features, dtype=torch.float).to(device)
+        
+        # Predict
         with torch.no_grad():
-            outputs = model(src_embeddings, tgt_embeddings, edge_features_tensor)
+            outputs = model(extended_data.x, extended_data.edge_index, src_tensor, tgt_tensor, edge_tensor)
             probs = outputs.squeeze().cpu().numpy()
         
         all_probs.extend(probs)
     
-    # Rank candidates by probability
+    # Rank and get top-k
     ranked_indices = np.argsort(-np.array(all_probs))
-    ranked_candidates = [candidates[i] for i in ranked_indices]
-    ranked_probs = [all_probs[i] for i in ranked_indices]
-    ranked_edge_features = [all_edge_features[i] for i in ranked_indices]
     
-    # Get edge feature names
-    if candidates:
-        sample_features = extract_edge_features(
-            paper_id, 
-            candidates[0], 
-            G, 
-            metadata, 
-            author_coauthor_G,
-            observed_citations_only=True,
-            observed_citations=observed_citations
-        )
-        edge_feature_names = list(sample_features.keys())
-    else:
-        edge_feature_names = []
-    
-    # Get top-k recommendations
     recommendations = []
-    for i, (candidate, prob, edge_feat) in enumerate(zip(ranked_candidates[:top_k], ranked_probs[:top_k], ranked_edge_features[:top_k])):
-        # Get metadata for the candidate
+    for i, idx in enumerate(ranked_indices[:top_k]):
+        candidate = candidates[idx]
         candidate_metadata = metadata.get(candidate, {})
+        
         recommendation = {
             'rank': i + 1,
             'id': candidate,
             'title': candidate_metadata.get('title', ''),
             'authors': candidate_metadata.get('authors', ''),
             'journal': candidate_metadata.get('journal', ''),
-            'score': float(prob)
+            'score': float(all_probs[idx])
         }
-        
-        # Add feature importance analysis if requested
-        if include_feature_importance:
-            src_embedding = paper_features_tensor  # Use the full tensor, not just first element
-            tgt_idx = node_mapping[candidate]
-            tgt_embedding = node_features[tgt_idx]
-            edge_features_tensor = torch.tensor(edge_feat, dtype=torch.float)
-            
-            importance_analysis = analyze_prediction_feature_importance(
-                model, src_embedding, tgt_embedding, edge_features_tensor, 
-                edge_feature_names, device
-            )
-            recommendation['feature_importance'] = importance_analysis
         
         recommendations.append(recommendation)
     
     return recommendations, paper_id, observed_citations, paper_metadata
 
-def inductive_evaluate_with_held_out(paper_json, G, metadata, model, node_features, 
-                                   node_mapping, reverse_mapping, author_coauthor_G=None, 
-                                   observed_ratio=0.75, top_k=10, device='cpu', random_seed=111, include_feature_importance=False):
-    """
-    Evaluate citation recommendations for a new paper with held-out citations.
-    
-    Args:
-        paper_json: Dictionary containing paper information
-        G: NetworkX graph with existing papers
-        metadata: Dictionary of paper metadata
-        model: Trained EnhancedCitationMLP model
-        node_features: Node features tensor for existing papers
-        node_mapping: Mapping from node IDs to indices
-        reverse_mapping: Mapping from indices to node IDs
-        author_coauthor_G: Author co-authorship graph (optional)
-        observed_ratio: Ratio of citations to observe
-        top_k: Number of top recommendations to consider
-        device: Device to run the model on
-        random_seed: Random seed for reproducible citation splitting (default: 111)
-        include_feature_importance: Whether to include feature importance analysis
-        
-    Returns:
-        Dictionary of evaluation metrics and recommendations
-    """
+def inductive_evaluate_with_held_out(paper_json, G, metadata, model, data, paper_embeddings_dict,
+                                   author_coauthor_G=None, observed_ratio=0.75, top_k=10, 
+                                   device='cpu', random_seed=111, include_feature_importance=False):
+    """Evaluate citation recommendations for a new paper with held-out citations."""
     # Extract all citations
     all_citations = []
     for ref in paper_json.get('references', []):
@@ -532,9 +1114,8 @@ def inductive_evaluate_with_held_out(paper_json, G, metadata, model, node_featur
         G, 
         metadata, 
         model, 
-        node_features, 
-        node_mapping, 
-        reverse_mapping, 
+        data,
+        paper_embeddings_dict,
         author_coauthor_G,
         top_k=top_k,
         exclude_observed=True,
@@ -556,10 +1137,8 @@ def inductive_evaluate_with_held_out(paper_json, G, metadata, model, node_featur
     dcg = 0
     for i, rec in enumerate(recommendations):
         if rec['id'] in held_out_citations:
-            # Log base 2 ranking (starting from 1)
             dcg += 1 / np.log2(i + 2)
     
-    # Ideal DCG: all held-out citations at the top positions
     idcg = 0
     for i in range(min(len(held_out_citations), top_k)):
         idcg += 1 / np.log2(i + 2)
@@ -581,1651 +1160,230 @@ def inductive_evaluate_with_held_out(paper_json, G, metadata, model, node_featur
         'held_out_citation_ids': held_out_citations
     }
 
-def load_articles(articles_file='articles.jsonl'):
-    """
-    Load articles from a JSONL file or from cache.
+def main(optimize_batch_size=True, use_mixed_precision=True, gradient_accumulation_steps=1, 
+         num_workers=12, pin_memory=True, epochs=1, batch_size=64, lr=0.001, device='auto'):
+    """Main function to build and train the GraphSAGE citation model with optimizations."""
+    print("Building GraphSAGE citation recommendation model...")
     
-    Args:
-        articles_file: Path to the articles file
-        
-    Returns:
-        List of article dictionaries
-    """
-    # Create cache directory if it doesn't exist
+    # Determine device
+    if device == 'auto':
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    
+    # Create cache directory
     os.makedirs('cache_gnn', exist_ok=True)
     
-    # Load articles
+    # Step 1: Load articles (with caching)
     articles_cache_path = 'cache_gnn/articles.pkl'
     if os.path.exists(articles_cache_path):
         print("Loading articles from cache...")
         with open(articles_cache_path, 'rb') as f:
             articles = pkl.load(f)
+        print(f"Loaded {len(articles)} articles from cache")
     else:
-        print(f"Loading articles from {articles_file}...")
-        with open(articles_file, 'r') as f:
-            articles = [json.loads(line) for line in f]
-        # Cache articles
+        print("Loading articles from file...")
+        articles = load_articles()
+        # Save articles cache immediately
+        print("Saving articles to cache...")
         with open(articles_cache_path, 'wb') as f:
             pkl.dump(articles, f)
+        print("Articles cached successfully")
     
-    print(f"Loaded {len(articles)} articles")
-    return articles
-
-def build_gnn_graph(articles, embedding_file='embeddings/papers_with_embeddings.pkl'):
-    """
-    Build a graph for GNN-based citation recommendation.
+    # Step 2: Build graph with embeddings (with caching)
+    graph_cache_path = 'cache_gnn/gnn_citation_graph.gpickle'
+    metadata_cache_path = 'cache_gnn/gnn_paper_metadata.json'
+    embeddings_cache_path = 'cache_gnn/paper_embeddings_dict.pkl'
     
-    Args:
-        articles: List of article dictionaries
-        embedding_file: Path to the file containing paper embeddings
-        
-    Returns:
-        Tuple of (graph, metadata_dict, main_article_count)
-    """
-    # Check if graph already exists in cache
-    gnn_graph_cache_path = 'cache_gnn/gnn_citation_graph.gpickle'
-    gnn_metadata_cache_path = 'cache_gnn/gnn_paper_metadata.json'
-    
-    if os.path.exists(gnn_graph_cache_path) and os.path.exists(gnn_metadata_cache_path):
-        print("Loading GNN graph and metadata from cache...")
-        with open(gnn_graph_cache_path, 'rb') as f:
+    if (os.path.exists(graph_cache_path) and 
+        os.path.exists(metadata_cache_path) and 
+        os.path.exists(embeddings_cache_path)):
+        print("Loading graph, metadata, and embeddings from cache...")
+        with open(graph_cache_path, 'rb') as f:
             G = pkl.load(f)
-        with open(gnn_metadata_cache_path, 'r') as f:
+        with open(metadata_cache_path, 'r') as f:
             metadata = json.load(f)
+        with open(embeddings_cache_path, 'rb') as f:
+            paper_embeddings_dict = pkl.load(f)
         main_article_count = len([node for node in metadata if metadata[node].get('is_main_article', False)])
+        print(f"Loaded graph with {G.number_of_nodes()} nodes and {G.number_of_edges()} edges from cache")
     else:
-        print("Creating GNN graph from articles...")
-        G, metadata, main_article_count = process_articles_to_gnn_graph(articles, embedding_file)
-        # Save graph and metadata
-        save_gnn_graph(G, metadata)
-    
-    # Print graph statistics
-    print_graph_statistics(G, metadata)
-    
-    return G, metadata, main_article_count
-
-def convert_to_pytorch_geometric(G, metadata):
-    """
-    Convert NetworkX graph to PyTorch Geometric format.
-    
-    Args:
-        G: NetworkX graph
-        metadata: Dictionary of paper metadata
-        
-    Returns:
-        PyTorch Geometric Data object
-    """
-    # Extract node features
-    node_ids = list(G.nodes())
-    node_mapping = {node_id: i for i, node_id in enumerate(node_ids)}
-    
-    # Create feature matrices
-    num_nodes = len(node_ids)
-    
-    # Get embedding dimension from first node
-    embedding_dim = len(G.nodes[node_ids[0]]['scibert_embedding'])
-    
-    # Initialize feature matrices
-    year_features = np.zeros((num_nodes, 1))
-    journal_features = np.zeros((num_nodes, 8))  # Assuming 8 journals
-    embedding_features = np.zeros((num_nodes, embedding_dim))
-    is_main_article = np.zeros((num_nodes, 1))
-    
-    # Fill feature matrices
-    for i, node_id in enumerate(node_ids):
-        # Year feature (normalized)
-        year = G.nodes[node_id].get('year', 0)
-        if isinstance(year, str) and year.isdigit():
-            year = int(year)
-        year_features[i, 0] = year
-        
-        # Journal encoding
-        journal_encoding = G.nodes[node_id].get('journal_encoding', [0] * 8)
-        journal_features[i] = journal_encoding
-        
-        # SciBERT embedding
-        embedding = G.nodes[node_id].get('scibert_embedding', [0] * embedding_dim)
-        embedding_features[i] = embedding
-        
-        # Is main article
-        is_main_article[i, 0] = 1 if metadata[node_id].get('is_main_article', False) else 0
-    
-    # Normalize year features
-    if np.std(year_features) > 0:
-        year_features = (year_features - np.mean(year_features)) / np.std(year_features)
-    
-    # Combine features
-    node_features = np.concatenate([
-        year_features,
-        journal_features,
-        embedding_features,
-        is_main_article
-    ], axis=1)
-    
-    # Convert to PyTorch tensors
-    node_features_tensor = torch.tensor(node_features, dtype=torch.float)
-    
-    # Create edge index
-    edges = list(G.edges())
-    edge_index = torch.tensor([[node_mapping[src], node_mapping[dst]] for src, dst in edges], 
-                             dtype=torch.long).t().contiguous()
-    
-    # Create PyTorch Geometric Data object
-    data = Data(x=node_features_tensor, edge_index=edge_index)
-    
-    # Store node mapping for reference
-    data.node_mapping = node_mapping
-    data.reverse_mapping = {i: node_id for node_id, i in node_mapping.items()}
-    
-    print(f"Created PyTorch Geometric Data object with {data.num_nodes} nodes and {data.num_edges} edges")
-    print(f"Node feature dimensions: {data.num_node_features}")
-    
-    return data
-
-def prepare_citation_prediction_data_with_edge_features(G, metadata, author_coauthor_G=None, split_ratio=0.8, random_seed=42):
-    """
-    Prepare data for citation prediction task with edge features.
-    
-    Args:
-        G: NetworkX graph
-        metadata: Dictionary of paper metadata
-        author_coauthor_G: Author co-authorship graph (optional)
-        split_ratio: Ratio of training to test data
-        random_seed: Random seed for reproducibility
-        
-    Returns:
-        Dictionary containing training and test data with edge features
-    """
-    # Set random seed for reproducibility
-    random.seed(random_seed)
-    np.random.seed(random_seed)
-    
-    # Get main articles
-    main_articles = [node for node in G.nodes() if metadata[node].get('is_main_article', True)]
-    print(f"Found {len(main_articles)} main articles")
-    
-    # Create positive and negative examples with edge features
-    positive_examples = []
-    negative_examples = []
-    
-    for main_article in tqdm(main_articles, desc="Creating citation examples with edge features"):
-        # Get papers that the main article cites
-        cited_papers = list(G.successors(main_article))
-        
-        # Add all positive examples with edge features
-        for cited_paper in cited_papers:
-            # Extract edge features
-            edge_features = extract_edge_features(main_article, cited_paper, G, metadata, author_coauthor_G)
-            positive_examples.append((main_article, cited_paper, 1, edge_features))
-        
-        # Get all papers that could be cited but aren't
-        all_papers = list(G.nodes())
-        non_cited_papers = [p for p in all_papers if p != main_article and p not in cited_papers]
-        
-        # Sample negative examples (5x the number of positive examples)
-        num_negative_samples = min(len(non_cited_papers), 5 * len(cited_papers))
-        if len(non_cited_papers) > num_negative_samples:
-            non_cited_papers = random.sample(non_cited_papers, num_negative_samples)
-        
-        # Add negative examples with edge features
-        for non_cited_paper in non_cited_papers:
-            # Extract edge features
-            edge_features = extract_edge_features(main_article, non_cited_paper, G, metadata, author_coauthor_G)
-            negative_examples.append((main_article, non_cited_paper, 0, edge_features))
-    
-    print(f"Created {len(positive_examples)} positive examples and {len(negative_examples)} negative examples")
-    
-    # Combine and shuffle examples
-    all_examples = positive_examples + negative_examples
-    random.shuffle(all_examples)
-    
-    # Split into training and test sets
-    split_idx = int(len(all_examples) * split_ratio)
-    train_examples = all_examples[:split_idx]
-    test_examples = all_examples[split_idx:]
-    
-    # Create node mapping for PyTorch Geometric
-    node_ids = list(G.nodes())
-    node_mapping = {node_id: i for i, node_id in enumerate(node_ids)}
-    
-    # Convert examples to tensor format
-    train_source_nodes = [node_mapping[src] for src, _, _, _ in train_examples]
-    train_target_nodes = [node_mapping[dst] for _, dst, _, _ in train_examples]
-    train_labels = [label for _, _, label, _ in train_examples]
-    train_edge_features = [list(features.values()) for _, _, _, features in train_examples]
-    
-    test_source_nodes = [node_mapping[src] for src, _, _, _ in test_examples]
-    test_target_nodes = [node_mapping[dst] for _, dst, _, _ in test_examples]
-    test_labels = [label for _, _, label, _ in test_examples]
-    test_edge_features = [list(features.values()) for _, _, _, features in test_examples]
-    
-    # Convert to PyTorch tensors
-    train_source_tensor = torch.tensor(train_source_nodes, dtype=torch.long)
-    train_target_tensor = torch.tensor(train_target_nodes, dtype=torch.long)
-    train_labels_tensor = torch.tensor(train_labels, dtype=torch.float)
-    train_edge_features_tensor = torch.tensor(train_edge_features, dtype=torch.float)
-    
-    test_source_tensor = torch.tensor(test_source_nodes, dtype=torch.long)
-    test_target_tensor = torch.tensor(test_target_nodes, dtype=torch.long)
-    test_labels_tensor = torch.tensor(test_labels, dtype=torch.float)
-    test_edge_features_tensor = torch.tensor(test_edge_features, dtype=torch.float)
-    
-    # Create data dictionary
-    data_dict = {
-        'train': {
-            'source_nodes': train_source_tensor,
-            'target_nodes': train_target_tensor,
-            'edge_features': train_edge_features_tensor,
-            'labels': train_labels_tensor,
-            'examples': train_examples
-        },
-        'test': {
-            'source_nodes': test_source_tensor,
-            'target_nodes': test_target_tensor,
-            'edge_features': test_edge_features_tensor,
-            'labels': test_labels_tensor,
-            'examples': test_examples
-        },
-        'node_mapping': node_mapping,
-        'reverse_mapping': {i: node_id for node_id, i in node_mapping.items()},
-        'edge_feature_names': list(train_examples[0][3].keys()) if train_examples else []
-    }
-    
-    print(f"Created training set with {len(train_examples)} examples")
-    print(f"Created test set with {len(test_examples)} examples")
-    print(f"Edge features: {data_dict['edge_feature_names']}")
-    
-    return data_dict
-
-def extract_edge_features(source_id, target_id, G, metadata, author_coauthor_G=None, observed_citations_only=False, observed_citations=None):
-    """
-    Extract edge features for a pair of papers.
-    
-    Args:
-        source_id: ID of the source paper
-        target_id: ID of the target paper
-        G: NetworkX graph
-        metadata: Dictionary of paper metadata
-        author_coauthor_G: Author co-authorship graph (optional)
-        observed_citations_only: Whether to use only observed citations for feature extraction
-        observed_citations: List of observed citation IDs (used when observed_citations_only=True)
-        
-    Returns:
-        Dictionary of edge features
-    """
-    features = {}
-    
-    # Get metadata for both papers
-    source_metadata = metadata.get(source_id, {})
-    target_metadata = metadata.get(target_id, {})
-    
-    # 1. Number of shared authors
-    authors1 = set(source_metadata.get('authors', '').split('; '))
-    authors2 = set(target_metadata.get('authors', '').split('; '))
-    features['shared_authors'] = len(authors1.intersection(authors2))
-    
-    # 2. Number of shared citations
-    if observed_citations_only and observed_citations is not None:
-        # Use only observed citations for feature extraction
-        citations1 = set(observed_citations)
-    else:
-        # Use all citations
-        citations1 = set(G.successors(source_id)) if source_id in G else set()
-    
-    citations2 = set(G.successors(target_id)) if target_id in G else set()
-    features['shared_citations'] = len(citations1.intersection(citations2))
-    
-    # 3. Common coauthor weight (if author_coauthor_G is provided)
-    common_coauthor_weight = 0
-    
-    if author_coauthor_G is not None:
-        # Convert author strings to the format used in the coauthorship graph
-        graph_authors1 = []
-        graph_authors2 = []
-        
-        for author in authors1:
-            parts = author.split()
-            if len(parts) >= 2:
-                first_initial = parts[0][0].lower() if parts[0] else ''
-                last_name = parts[-1].lower()
-                if first_initial:
-                    graph_authors1.append(f"{first_initial}. {last_name}")
-        
-        for author in authors2:
-            parts = author.split()
-            if len(parts) >= 2:
-                first_initial = parts[0][0].lower() if parts[0] else ''
-                last_name = parts[-1].lower()
-                if first_initial:
-                    graph_authors2.append(f"{first_initial}. {last_name}")
-        
-        # Check for common coauthors in the coauthorship graph and use edge weights
-        total_coauthor_weight = 0
-        total_author_pairs = len(graph_authors1) * len(graph_authors2)
-        
-        for author1 in graph_authors1:
-            if author1 in author_coauthor_G:
-                for author2 in graph_authors2:
-                    if author2 in author_coauthor_G:
-                        # Check if these authors have common coauthors
-                        coauthors1 = set(author_coauthor_G.neighbors(author1))
-                        coauthors2 = set(author_coauthor_G.neighbors(author2))
-                        common_coauthors = coauthors1.intersection(coauthors2)
-                        
-                        # Sum the weights of coauthorship connections
-                        for common_coauthor in common_coauthors:
-                            # Get weights from the coauthorship graph
-                            weight1 = author_coauthor_G[author1][common_coauthor].get('weight', 1)
-                            weight2 = author_coauthor_G[author2][common_coauthor].get('weight', 1)
-                            total_coauthor_weight += weight1 + weight2
-        
-        # Scale by the number of pairwise coauthors
-        if total_author_pairs > 0:
-            common_coauthor_weight = total_coauthor_weight / total_author_pairs
-    
-    features['common_coauthor_weight'] = common_coauthor_weight
-    
-    # 4. Add new features for partial citation prediction
-    if observed_citations_only and observed_citations is not None:
-        # Calculate how many observed citations cite the target paper
-        target_citations = set(G.predecessors(target_id)) if target_id in G else set()
-        observed_citing_target = len([c for c in observed_citations if c in target_citations])
-        features['observed_citing_target'] = observed_citing_target
-        
-        # Calculate how many papers are cited by both observed citations and the target
-        target_cites = set(G.successors(target_id)) if target_id in G else set()
-        observed_citation_cites = set()
-        for c in observed_citations:
-            observed_citation_cites.update(G.successors(c) if c in G else set())
-        features['common_citations_with_observed'] = len(observed_citation_cites.intersection(target_cites))
-    else:
-        features['observed_citing_target'] = 0
-        features['common_citations_with_observed'] = 0
-    
-    return features
-
-def process_articles_to_author_graphs(articles):
-    """
-    Create author coauthorship graph from articles.
-    
-    Args:
-        articles: List of article dictionaries
-        
-    Returns:
-        NetworkX graph of author coauthorships
-    """
-    # Create undirected graph for coauthorships
-    author_coauthor_G = nx.Graph()
-    
-    # Dictionary to track coauthorship counts
-    coauthor_counts = defaultdict(lambda: defaultdict(int))
-    
-    # Process each article
-    print("Building author coauthorship graph...")
-    for article in tqdm(articles):
-        # Skip if missing key fields
-        if not article.get('title') or not article.get('published_date') or not article.get('authors'):
-            continue
-            
-        # Skip articles that should be filtered out
-        if should_filter_title(article.get('title', '')):
-            continue
-            
-        # Format authors
-        formatted_authors = []
-        for author in article.get('authors', []):
-            formatted_name = format_author_name(author)
-            if formatted_name:
-                formatted_authors.append(formatted_name)
-        
-        # Process coauthorship relationships
-        for i, author1 in enumerate(formatted_authors):
-            for author2 in formatted_authors[i+1:]:
-                coauthor_counts[author1][author2] += 1
-                coauthor_counts[author2][author1] += 1
-    
-    # Build the coauthorship graph
-    for author1, coauthors in coauthor_counts.items():
-        for author2, coauthor_weight in coauthors.items():
-            author_coauthor_G.add_edge(author1, author2, weight=coauthor_weight)
-    
-    print(f"Created author coauthorship graph with {len(author_coauthor_G.nodes())} authors and {len(author_coauthor_G.edges())} coauthorship relationships")
-    
-    return author_coauthor_G
-
-def test_edge_features():
-    """
-    Test function to extract edge features for a sample of paper pairs.
-    """
-    print("Testing edge feature extraction...")
-    
-    # Load articles
-    articles = load_articles()
-    
-    # Build GNN graph
-    G, metadata, _ = build_gnn_graph(articles)
-    
-    # Build author coauthorship graph
-    author_coauthor_G = process_articles_to_author_graphs(articles)
-    
-    # Get a sample of main articles
-    main_articles = [node for node in G.nodes() if metadata[node].get('is_main_article', True)]
-    sample_main_articles = random.sample(main_articles, min(5, len(main_articles)))
-    
-    # For each sample main article, get a cited paper and a non-cited paper
-    for main_article in sample_main_articles:
-        print(f"\nMain article: {metadata[main_article].get('title')}")
-        
-        # Get a cited paper
-        cited_papers = list(G.successors(main_article))
-        if cited_papers:
-            cited_paper = random.choice(cited_papers)
-            print(f"Cited paper: {metadata[cited_paper].get('title')}")
-            
-            # Extract edge features
-            features = extract_edge_features(main_article, cited_paper, G, metadata, author_coauthor_G)
-            print("Edge features for cited paper:")
-            for feature, value in features.items():
-                print(f"  {feature}: {value}")
-        
-        # Get a non-cited paper
-        all_papers = list(G.nodes())
-        non_cited_papers = [p for p in all_papers if p != main_article and p not in G.successors(main_article)]
-        if non_cited_papers:
-            non_cited_paper = random.choice(non_cited_papers)
-            print(f"Non-cited paper: {metadata[non_cited_paper].get('title')}")
-            
-            # Extract edge features
-            features = extract_edge_features(main_article, non_cited_paper, G, metadata, author_coauthor_G)
-            print("Edge features for non-cited paper:")
-            for feature, value in features.items():
-                print(f"  {feature}: {value}")
-
-class EnhancedCitationMLP(nn.Module):
-    """
-    Enhanced Multilayer Perceptron for citation prediction with partial citation information.
-    
-    Combines node embeddings, edge features, and citation context to predict missing citations.
-    """
-    def __init__(self, node_embedding_dim, edge_feature_dim, hidden_dims=[128, 64]):
-        super(EnhancedCitationMLP, self).__init__()
-        
-        # Input dimensions
-        self.node_embedding_dim = node_embedding_dim
-        self.edge_feature_dim = edge_feature_dim
-        self.input_dim = 2 * node_embedding_dim + edge_feature_dim  # Source + target embeddings + edge features
-        
-        # Build MLP layers
-        layers = []
-        prev_dim = self.input_dim
-        
-        for hidden_dim in hidden_dims:
-            layers.append(nn.Linear(prev_dim, hidden_dim))
-            layers.append(nn.ReLU())
-            layers.append(nn.BatchNorm1d(hidden_dim))
-            layers.append(nn.Dropout(0.2))
-            prev_dim = hidden_dim
-        
-        # Output layer
-        layers.append(nn.Linear(prev_dim, 1))
-        layers.append(nn.Sigmoid())
-        
-        self.mlp = nn.Sequential(*layers)
-    
-    def forward(self, source_embeddings, target_embeddings, edge_features):
-        """
-        Forward pass through the MLP.
-        
-        Args:
-            source_embeddings: Embeddings of source nodes [batch_size, node_embedding_dim]
-            target_embeddings: Embeddings of target nodes [batch_size, node_embedding_dim]
-            edge_features: Edge features [batch_size, edge_feature_dim]
-            
-        Returns:
-            Citation prediction probabilities [batch_size, 1]
-        """
-        # Concatenate source embeddings, target embeddings, and edge features
-        combined_features = torch.cat([source_embeddings, target_embeddings, edge_features], dim=1)
-        
-        # Pass through MLP
-        return self.mlp(combined_features)
-
-def train_citation_mlp(data, citation_data, device='cuda', batch_size=64, epochs=10, lr=0.001):
-    """
-    Train a MLP model for citation prediction.
-    
-    Args:
-        data: PyTorch Geometric Data object with node features
-        citation_data: Dictionary with citation prediction data
-        device: Device to train on ('cuda' or 'cpu')
-        batch_size: Batch size for training
-        epochs: Number of training epochs
-        lr: Learning rate
-        
-    Returns:
-        Trained model and training history
-    """
-    # Check if CUDA is available
-    if device == 'cuda' and not torch.cuda.is_available():
-        print("CUDA not available, using CPU instead")
-        device = 'cpu'
-    
-    # Get node embeddings
-    node_features = data.x.to(device)
-    
-    # Get training data
-    train_source_nodes = citation_data['train']['source_nodes'].to(device)
-    train_target_nodes = citation_data['train']['target_nodes'].to(device)
-    train_edge_features = citation_data['train']['edge_features'].to(device)
-    train_labels = citation_data['train']['labels'].to(device)
-    
-    # Create dataset and dataloader
-    train_dataset = TensorDataset(train_source_nodes, train_target_nodes, train_edge_features, train_labels)
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    
-    # Get dimensions
-    node_embedding_dim = node_features.shape[1]
-    edge_feature_dim = train_edge_features.shape[1]
-    
-    # Initialize model
-    model = EnhancedCitationMLP(node_embedding_dim, edge_feature_dim).to(device)
-    
-    # Loss function and optimizer
-    criterion = nn.BCELoss()
-    optimizer = optim.Adam(model.parameters(), lr=lr)
-    
-    # Training history
-    history = {
-        'loss': [],
-        'val_loss': [],
-        'val_accuracy': [],
-        'val_precision': [],
-        'val_recall': [],
-        'val_f1': [],
-        'val_auc': []
-    }
-    
-    # Training loop
-    for epoch in range(epochs):
-        model.train()
-        total_loss = 0
-        
-        # Progress bar for training
-        progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}")
-        
-        for batch_src, batch_tgt, batch_edge, batch_labels in progress_bar:
-            # Get node embeddings for source and target nodes
-            src_embeddings = node_features[batch_src]
-            tgt_embeddings = node_features[batch_tgt]
-            
-            # Forward pass
-            optimizer.zero_grad()
-            outputs = model(src_embeddings, tgt_embeddings, batch_edge)
-            loss = criterion(outputs.squeeze(), batch_labels)
-            
-            # Backward pass and optimize
-            loss.backward()
-            optimizer.step()
-            
-            # Update progress bar
-            total_loss += loss.item()
-            progress_bar.set_postfix({'loss': total_loss / (progress_bar.n + 1)})
-        
-        # Calculate average loss for the epoch
-        avg_loss = total_loss / len(train_loader)
-        history['loss'].append(avg_loss)
-        
-        # Evaluate on validation set
-        val_metrics = evaluate_citation_mlp(model, data, citation_data, device, batch_size)
-        
-        # Update history
-        history['val_loss'].append(val_metrics['loss'])
-        history['val_accuracy'].append(val_metrics['accuracy'])
-        history['val_precision'].append(val_metrics['precision'])
-        history['val_recall'].append(val_metrics['recall'])
-        history['val_f1'].append(val_metrics['f1'])
-        history['val_auc'].append(val_metrics['auc'])
-        
-        # Print metrics
-        print(f"Epoch {epoch+1}/{epochs} - Loss: {avg_loss:.4f} - Val Loss: {val_metrics['loss']:.4f} - "
-              f"Val Accuracy: {val_metrics['accuracy']:.4f} - Val F1: {val_metrics['f1']:.4f} - "
-              f"Val AUC: {val_metrics['auc']:.4f}")
-    
-    return model, history
-
-def evaluate_citation_mlp(model, data, citation_data, device='cuda', batch_size=64):
-    """
-    Evaluate the MLP model on the test set.
-    
-    Args:
-        model: Trained CitationMLP model
-        data: PyTorch Geometric Data object with node features
-        citation_data: Dictionary with citation prediction data
-        device: Device to evaluate on ('cuda' or 'cpu')
-        batch_size: Batch size for evaluation
-        
-    Returns:
-        Dictionary of evaluation metrics
-    """
-    model.eval()
-    
-    # Get node embeddings
-    node_features = data.x.to(device)
-    
-    # Get test data
-    test_source_nodes = citation_data['test']['source_nodes'].to(device)
-    test_target_nodes = citation_data['test']['target_nodes'].to(device)
-    test_edge_features = citation_data['test']['edge_features'].to(device)
-    test_labels = citation_data['test']['labels'].to(device)
-    
-    # Create dataset and dataloader
-    test_dataset = TensorDataset(test_source_nodes, test_target_nodes, test_edge_features, test_labels)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size)
-    
-    # Loss function
-    criterion = nn.BCELoss()
-    
-    # Evaluation
-    total_loss = 0
-    all_preds = []
-    all_probs = []
-    all_labels = []
-    
-    with torch.no_grad():
-        for batch_src, batch_tgt, batch_edge, batch_labels in test_loader:
-            # Get node embeddings for source and target nodes
-            src_embeddings = node_features[batch_src]
-            tgt_embeddings = node_features[batch_tgt]
-            
-            # Forward pass
-            outputs = model(src_embeddings, tgt_embeddings, batch_edge)
-            loss = criterion(outputs.squeeze(), batch_labels)
-            
-            # Store predictions and labels
-            probs = outputs.squeeze().cpu().numpy()
-            preds = (probs >= 0.5).astype(int)
-            labels = batch_labels.cpu().numpy()
-            
-            all_probs.extend(probs)
-            all_preds.extend(preds)
-            all_labels.extend(labels)
-            
-            total_loss += loss.item()
-    
-    # Calculate metrics
-    avg_loss = total_loss / len(test_loader)
-    accuracy = accuracy_score(all_labels, all_preds)
-    precision = precision_score(all_labels, all_preds)
-    recall = recall_score(all_labels, all_preds)
-    f1 = f1_score(all_labels, all_preds)
-    auc = roc_auc_score(all_labels, all_probs)
-    
-    # Return metrics
-    return {
-        'loss': avg_loss,
-        'accuracy': accuracy,
-        'precision': precision,
-        'recall': recall,
-        'f1': f1,
-        'auc': auc,
-        'predictions': all_preds,
-        'probabilities': all_probs,
-        'labels': all_labels
-    }
-
-def plot_training_history(history):
-    """
-    Plot training history.
-    
-    Args:
-        history: Dictionary of training history
-        
-    Returns:
-        None
-    """
-    # Create figure with subplots
-    fig, axs = plt.subplots(2, 2, figsize=(15, 10))
-    
-    # Plot loss
-    axs[0, 0].plot(history['loss'], label='Training Loss')
-    axs[0, 0].plot(history['val_loss'], label='Validation Loss')
-    axs[0, 0].set_title('Loss')
-    axs[0, 0].set_xlabel('Epoch')
-    axs[0, 0].set_ylabel('Loss')
-    axs[0, 0].legend()
-    
-    # Plot accuracy
-    axs[0, 1].plot(history['val_accuracy'], label='Validation Accuracy')
-    axs[0, 1].set_title('Accuracy')
-    axs[0, 1].set_xlabel('Epoch')
-    axs[0, 1].set_ylabel('Accuracy')
-    axs[0, 1].legend()
-    
-    # Plot precision, recall, F1
-    axs[1, 0].plot(history['val_precision'], label='Precision')
-    axs[1, 0].plot(history['val_recall'], label='Recall')
-    axs[1, 0].plot(history['val_f1'], label='F1 Score')
-    axs[1, 0].set_title('Precision, Recall, F1')
-    axs[1, 0].set_xlabel('Epoch')
-    axs[1, 0].set_ylabel('Score')
-    axs[1, 0].legend()
-    
-    # Plot AUC
-    axs[1, 1].plot(history['val_auc'], label='AUC')
-    axs[1, 1].set_title('AUC')
-    axs[1, 1].set_xlabel('Epoch')
-    axs[1, 1].set_ylabel('AUC')
-    axs[1, 1].legend()
-    
-    # Adjust layout and save
-    plt.tight_layout()
-    plt.savefig('citation_mlp_training_history.png')
-    plt.close()
-
-def analyze_feature_importance(model, data, citation_data, device='cuda'):
-    """
-    Analyze feature importance for the citation prediction model.
-    
-    Args:
-        model: Trained model (CitationMLP or EnhancedCitationMLP)
-        data: PyTorch Geometric Data object with node features
-        citation_data: Dictionary with citation prediction data
-        device: Device to evaluate on ('cuda' or 'cpu')
-        
-    Returns:
-        Dictionary mapping feature names to importance scores
-    """
-    model.eval()
-    
-    # Get node embeddings
-    node_features = data.x.to(device)
-    
-    # Get test data
-    test_source_nodes = citation_data['test']['source_nodes'].to(device)
-    test_target_nodes = citation_data['test']['target_nodes'].to(device)
-    test_edge_features = citation_data['test']['edge_features'].to(device)
-    test_labels = citation_data['test']['labels'].to(device)
-    
-    # Get feature names
-    feature_names = citation_data['edge_feature_names']
-    
-    # Create a baseline prediction
-    with torch.no_grad():
-        src_embeddings = node_features[test_source_nodes]
-        tgt_embeddings = node_features[test_target_nodes]
-        baseline_outputs = model(src_embeddings, tgt_embeddings, test_edge_features)
-        baseline_probs = baseline_outputs.squeeze().cpu().numpy()
-    
-    # Calculate importance for each feature
-    feature_importance = {}
-    
-    for i, feature_name in enumerate(feature_names):
-        # Create a copy of edge features with the current feature zeroed out
-        modified_edge_features = test_edge_features.clone()
-        modified_edge_features[:, i] = 0
-        
-        # Get predictions with the modified features
-        with torch.no_grad():
-            modified_outputs = model(src_embeddings, tgt_embeddings, modified_edge_features)
-            modified_probs = modified_outputs.squeeze().cpu().numpy()
-        
-        # Calculate the absolute difference in predictions
-        importance = np.mean(np.abs(baseline_probs - modified_probs))
-        feature_importance[feature_name] = float(importance)
-    
-    # Normalize importance scores
-    total_importance = sum(feature_importance.values())
-    if total_importance > 0:
-        for feature_name in feature_importance:
-            feature_importance[feature_name] /= total_importance
-    
-    # Sort by importance
-    feature_importance = {k: v for k, v in sorted(feature_importance.items(), key=lambda item: item[1], reverse=True)}
-    
-    return feature_importance
-
-def plot_confusion_matrix(y_true, y_pred, classes=['No Citation', 'Citation'], normalize=False, title=None, cmap=plt.cm.Blues):
-    """
-    Plot confusion matrix for citation prediction results.
-    
-    Args:
-        y_true: True labels
-        y_pred: Predicted labels
-        classes: List of class names
-        normalize: Whether to normalize the confusion matrix
-        title: Plot title
-        cmap: Color map
-        
-    Returns:
-        None
-    """
-    from sklearn.metrics import confusion_matrix
-    import matplotlib.pyplot as plt
-    import numpy as np
-    
-    if not title:
-        if normalize:
-            title = 'Normalized confusion matrix'
-        else:
-            title = 'Confusion matrix'
-    
-    # Compute confusion matrix
-    cm = confusion_matrix(y_true, y_pred)
-    
-    if normalize:
-        cm = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis]
-    
-    fig, ax = plt.subplots(figsize=(8, 6))
-    im = ax.imshow(cm, interpolation='nearest', cmap=cmap)
-    ax.figure.colorbar(im, ax=ax)
-    
-    # We want to show all ticks...
-    ax.set(xticks=np.arange(cm.shape[1]),
-           yticks=np.arange(cm.shape[0]),
-           xticklabels=classes, yticklabels=classes,
-           title=title,
-           ylabel='True label',
-           xlabel='Predicted label')
-    
-    # Rotate the tick labels and set their alignment.
-    plt.setp(ax.get_xticklabels(), rotation=45, ha="right", rotation_mode="anchor")
-    
-    # Loop over data dimensions and create text annotations.
-    fmt = '.2f' if normalize else 'd'
-    thresh = cm.max() / 2.
-    for i in range(cm.shape[0]):
-        for j in range(cm.shape[1]):
-            ax.text(j, i, format(cm[i, j], fmt),
-                    ha="center", va="center",
-                    color="white" if cm[i, j] > thresh else "black")
-    
-    fig.tight_layout()
-    plt.savefig('citation_confusion_matrix.png')
-    plt.close()
-    
-    return ax
-
-def prepare_partial_citation_prediction_data(G, metadata, author_coauthor_G=None, observed_ratio=0.75, split_ratio=0.8, random_seed=42):
-    """
-    Prepare data for partial citation prediction task with edge features.
-    For each main article, we observe only a portion of its citations and predict the rest.
-    
-    Args:
-        G: NetworkX graph
-        metadata: Dictionary of paper metadata
-        author_coauthor_G: Author co-authorship graph (optional)
-        observed_ratio: Ratio of citations to observe for each paper (e.g., 0.75 means we observe 75% of citations)
-        split_ratio: Ratio of papers to use for training vs. testing
-        random_seed: Random seed for reproducibility
-        
-    Returns:
-        Dictionary containing training and test data with edge features
-    """
-    # Set random seed for reproducibility
-    random.seed(random_seed)
-    np.random.seed(random_seed)
-    
-    # Get main articles
-    main_articles = [node for node in G.nodes() if metadata[node].get('is_main_article', True)]
-    print(f"Found {len(main_articles)} main articles")
-    
-    # Split main articles into training and test sets
-    random.shuffle(main_articles)
-    split_idx = int(len(main_articles) * split_ratio)
-    train_main_articles = main_articles[:split_idx]
-    test_main_articles = main_articles[split_idx:]
-    
-    print(f"Using {len(train_main_articles)} main articles for training")
-    print(f"Using {len(test_main_articles)} main articles for testing")
-    
-    # Create examples for training and testing
-    train_examples = []
-    test_examples = []
-    
-    # Process training articles
-    print("Creating training examples with partial citation information...")
-    for main_article in tqdm(train_main_articles, desc="Processing training articles"):
-        # Get papers that the main article cites
-        cited_papers = list(G.successors(main_article))
-        
-        if len(cited_papers) < 2:
-            # Skip articles with too few citations
-            continue
-        
-        # Randomly split citations into observed and held-out sets
-        random.shuffle(cited_papers)
-        num_observed = max(1, int(len(cited_papers) * observed_ratio))
-        observed_citations = cited_papers[:num_observed]
-        held_out_citations = cited_papers[num_observed:]
-        
-        # Add positive examples for held-out citations
-        for cited_paper in held_out_citations:
-            # Extract edge features (using only observed citations for feature extraction)
-            edge_features = extract_edge_features(
-                main_article, 
-                cited_paper, 
-                G, 
-                metadata, 
-                author_coauthor_G,
-                observed_citations_only=True,
-                observed_citations=observed_citations
-            )
-            train_examples.append((main_article, cited_paper, 1, edge_features, observed_citations))
-        
-        # Sample negative examples (papers that are not cited)
-        all_papers = list(G.nodes())
-        non_cited_papers = [p for p in all_papers if p != main_article and p not in cited_papers]
-        
-        # Sample negative examples (same number as positive examples for balance)
-        num_negative_samples = min(len(non_cited_papers), len(held_out_citations) * 5)  # 5:1 ratio
-        if len(non_cited_papers) > num_negative_samples:
-            non_cited_papers = random.sample(non_cited_papers, num_negative_samples)
-        
-        # Add negative examples
-        for non_cited_paper in non_cited_papers:
-            # Extract edge features (using only observed citations)
-            edge_features = extract_edge_features(
-                main_article, 
-                non_cited_paper, 
-                G, 
-                metadata, 
-                author_coauthor_G,
-                observed_citations_only=True,
-                observed_citations=observed_citations
-            )
-            train_examples.append((main_article, non_cited_paper, 0, edge_features, observed_citations))
-    
-    # Process test articles
-    print("Creating test examples with partial citation information...")
-    for main_article in tqdm(test_main_articles, desc="Processing test articles"):
-        # Get papers that the main article cites
-        cited_papers = list(G.successors(main_article))
-        
-        if len(cited_papers) < 2:
-            # Skip articles with too few citations
-            continue
-        
-        # Randomly split citations into observed and held-out sets
-        random.shuffle(cited_papers)
-        num_observed = max(1, int(len(cited_papers) * observed_ratio))
-        observed_citations = cited_papers[:num_observed]
-        held_out_citations = cited_papers[num_observed:]
-        
-        # Add positive examples for held-out citations
-        for cited_paper in held_out_citations:
-            # Extract edge features (using only observed citations)
-            edge_features = extract_edge_features(
-                main_article, 
-                cited_paper, 
-                G, 
-                metadata, 
-                author_coauthor_G,
-                observed_citations_only=True,
-                observed_citations=observed_citations
-            )
-            test_examples.append((main_article, cited_paper, 1, edge_features, observed_citations))
-        
-        # Sample negative examples (papers that are not cited)
-        all_papers = list(G.nodes())
-        non_cited_papers = [p for p in all_papers if p != main_article and p not in cited_papers]
-        
-        # Sample negative examples (same number as positive examples for balance)
-        num_negative_samples = min(len(non_cited_papers), len(held_out_citations) * 5)  # 5:1 ratio
-        if len(non_cited_papers) > num_negative_samples:
-            non_cited_papers = random.sample(non_cited_papers, num_negative_samples)
-        
-        # Add negative examples
-        for non_cited_paper in non_cited_papers:
-            # Extract edge features (using only observed citations)
-            edge_features = extract_edge_features(
-                main_article, 
-                non_cited_paper, 
-                G, 
-                metadata, 
-                author_coauthor_G,
-                observed_citations_only=True,
-                observed_citations=observed_citations
-            )
-            test_examples.append((main_article, non_cited_paper, 0, edge_features, observed_citations))
-    
-    print(f"Created {len(train_examples)} training examples")
-    print(f"Created {len(test_examples)} test examples")
-    
-    # Create node mapping for PyTorch Geometric
-    node_ids = list(G.nodes())
-    node_mapping = {node_id: i for i, node_id in enumerate(node_ids)}
-    
-    # Convert examples to tensor format
-    train_source_nodes = [node_mapping[src] for src, _, _, _, _ in train_examples]
-    train_target_nodes = [node_mapping[dst] for _, dst, _, _, _ in train_examples]
-    train_labels = [label for _, _, label, _, _ in train_examples]
-    train_edge_features = [list(features.values()) for _, _, _, features, _ in train_examples]
-    train_observed_citations = [[node_mapping[c] for c in obs_cites] for _, _, _, _, obs_cites in train_examples]
-    
-    test_source_nodes = [node_mapping[src] for src, _, _, _, _ in test_examples]
-    test_target_nodes = [node_mapping[dst] for _, dst, _, _, _ in test_examples]
-    test_labels = [label for _, _, label, _, _ in test_examples]
-    test_edge_features = [list(features.values()) for _, _, _, features, _ in test_examples]
-    test_observed_citations = [[node_mapping[c] for c in obs_cites] for _, _, _, _, obs_cites in test_examples]
-    
-    # Convert to PyTorch tensors
-    train_source_tensor = torch.tensor(train_source_nodes, dtype=torch.long)
-    train_target_tensor = torch.tensor(train_target_nodes, dtype=torch.long)
-    train_labels_tensor = torch.tensor(train_labels, dtype=torch.float)
-    train_edge_features_tensor = torch.tensor(train_edge_features, dtype=torch.float)
-    
-    test_source_tensor = torch.tensor(test_source_nodes, dtype=torch.long)
-    test_target_tensor = torch.tensor(test_target_nodes, dtype=torch.long)
-    test_labels_tensor = torch.tensor(test_labels, dtype=torch.float)
-    test_edge_features_tensor = torch.tensor(test_edge_features, dtype=torch.float)
-    
-    # Create data dictionary
-    data_dict = {
-        'train': {
-            'source_nodes': train_source_tensor,
-            'target_nodes': train_target_tensor,
-            'edge_features': train_edge_features_tensor,
-            'labels': train_labels_tensor,
-            'observed_citations': train_observed_citations,
-            'examples': train_examples
-        },
-        'test': {
-            'source_nodes': test_source_tensor,
-            'target_nodes': test_target_tensor,
-            'edge_features': test_edge_features_tensor,
-            'labels': test_labels_tensor,
-            'observed_citations': test_observed_citations,
-            'examples': test_examples
-        },
-        'node_mapping': node_mapping,
-        'reverse_mapping': {i: node_id for node_id, i in node_mapping.items()},
-        'edge_feature_names': list(train_examples[0][3].keys()) if train_examples else []
-    }
-    
-    return data_dict
-
-def train_partial_citation_mlp(data, citation_data, device='cuda', batch_size=64, epochs=10, lr=0.001):
-    """
-    Train a MLP model for partial citation prediction.
-    
-    Args:
-        data: PyTorch Geometric Data object with node features
-        citation_data: Dictionary with partial citation prediction data
-        device: Device to train on ('cuda' or 'cpu')
-        batch_size: Batch size for training
-        epochs: Number of training epochs
-        lr: Learning rate
-        
-    Returns:
-        Trained model and training history
-    """
-    # Check if CUDA is available
-    if device == 'cuda' and not torch.cuda.is_available():
-        print("CUDA not available, using CPU instead")
-        device = 'cpu'
-    
-    # Get node embeddings
-    node_features = data.x.to(device)
-    
-    # Get training data
-    train_source_nodes = citation_data['train']['source_nodes'].to(device)
-    train_target_nodes = citation_data['train']['target_nodes'].to(device)
-    train_edge_features = citation_data['train']['edge_features'].to(device)
-    train_labels = citation_data['train']['labels'].to(device)
-    
-    # Create dataset and dataloader
-    train_dataset = TensorDataset(train_source_nodes, train_target_nodes, train_edge_features, train_labels)
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    
-    # Get dimensions
-    node_embedding_dim = node_features.shape[1]
-    edge_feature_dim = train_edge_features.shape[1]
-    
-    # Initialize model
-    model = EnhancedCitationMLP(node_embedding_dim, edge_feature_dim).to(device)
-    
-    # Loss function and optimizer
-    criterion = nn.BCELoss()
-    optimizer = optim.Adam(model.parameters(), lr=lr)
-    
-    # Training history
-    history = {
-        'loss': [],
-        'val_loss': [],
-        'val_accuracy': [],
-        'val_precision': [],
-        'val_recall': [],
-        'val_f1': [],
-        'val_auc': []
-    }
-    
-    # Training loop
-    for epoch in range(epochs):
-        model.train()
-        total_loss = 0
-        
-        # Progress bar for training
-        progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}")
-        
-        for batch_src, batch_tgt, batch_edge, batch_labels in progress_bar:
-            # Get node embeddings for source and target nodes
-            src_embeddings = node_features[batch_src]
-            tgt_embeddings = node_features[batch_tgt]
-            
-            # Forward pass
-            optimizer.zero_grad()
-            outputs = model(src_embeddings, tgt_embeddings, batch_edge)
-            loss = criterion(outputs.squeeze(), batch_labels)
-            
-            # Backward pass and optimize
-            loss.backward()
-            optimizer.step()
-            
-            # Update progress bar
-            total_loss += loss.item()
-            progress_bar.set_postfix({'loss': total_loss / (progress_bar.n + 1)})
-        
-        # Calculate average loss for the epoch
-        avg_loss = total_loss / len(train_loader)
-        history['loss'].append(avg_loss)
-        
-        # Evaluate on validation set
-        val_metrics = evaluate_partial_citation_mlp(model, data, citation_data, device, batch_size)
-        
-        # Update history
-        history['val_loss'].append(val_metrics['loss'])
-        history['val_accuracy'].append(val_metrics['accuracy'])
-        history['val_precision'].append(val_metrics['precision'])
-        history['val_recall'].append(val_metrics['recall'])
-        history['val_f1'].append(val_metrics['f1'])
-        history['val_auc'].append(val_metrics['auc'])
-        
-        # Print metrics
-        print(f"Epoch {epoch+1}/{epochs} - Loss: {avg_loss:.4f} - Val Loss: {val_metrics['loss']:.4f} - "
-              f"Val Accuracy: {val_metrics['accuracy']:.4f} - Val F1: {val_metrics['f1']:.4f} - "
-              f"Val AUC: {val_metrics['auc']:.4f}")
-    
-    return model, history
-
-def evaluate_partial_citation_mlp(model, data, citation_data, device='cuda', batch_size=64):
-    """
-    Evaluate the MLP model on the test set for partial citation prediction.
-    
-    Args:
-        model: Trained EnhancedCitationMLP model
-        data: PyTorch Geometric Data object with node features
-        citation_data: Dictionary with partial citation prediction data
-        device: Device to evaluate on ('cuda' or 'cpu')
-        batch_size: Batch size for evaluation
-        
-    Returns:
-        Dictionary of evaluation metrics
-    """
-    model.eval()
-    
-    # Get node embeddings
-    node_features = data.x.to(device)
-    
-    # Get test data
-    test_source_nodes = citation_data['test']['source_nodes'].to(device)
-    test_target_nodes = citation_data['test']['target_nodes'].to(device)
-    test_edge_features = citation_data['test']['edge_features'].to(device)
-    test_labels = citation_data['test']['labels'].to(device)
-    
-    # Create dataset and dataloader
-    test_dataset = TensorDataset(test_source_nodes, test_target_nodes, test_edge_features, test_labels)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size)
-    
-    # Loss function
-    criterion = nn.BCELoss()
-    
-    # Evaluation
-    total_loss = 0
-    all_preds = []
-    all_probs = []
-    all_labels = []
-    
-    with torch.no_grad():
-        for batch_src, batch_tgt, batch_edge, batch_labels in test_loader:
-            # Get node embeddings for source and target nodes
-            src_embeddings = node_features[batch_src]
-            tgt_embeddings = node_features[batch_tgt]
-            
-            # Forward pass
-            outputs = model(src_embeddings, tgt_embeddings, batch_edge)
-            loss = criterion(outputs.squeeze(), batch_labels)
-            
-            # Store predictions and labels
-            probs = outputs.squeeze().cpu().numpy()
-            preds = (probs >= 0.5).astype(int)
-            labels = batch_labels.cpu().numpy()
-            
-            all_probs.extend(probs)
-            all_preds.extend(preds)
-            all_labels.extend(labels)
-            
-            total_loss += loss.item()
-    
-    # Calculate metrics
-    avg_loss = total_loss / len(test_loader)
-    accuracy = accuracy_score(all_labels, all_preds)
-    precision = precision_score(all_labels, all_preds)
-    recall = recall_score(all_labels, all_preds)
-    f1 = f1_score(all_labels, all_preds)
-    auc = roc_auc_score(all_labels, all_probs)
-    
-    # Return metrics
-    return {
-        'loss': avg_loss,
-        'accuracy': accuracy,
-        'precision': precision,
-        'recall': recall,
-        'f1': f1,
-        'auc': auc,
-        'predictions': all_preds,
-        'probabilities': all_probs,
-        'labels': all_labels
-    }
-
-def evaluate_citation_recommendations(model, data, citation_data, G, metadata, top_k=10, device='cuda'):
-    """
-    Evaluate citation recommendations for papers with partial citation information.
-    
-    Args:
-        model: Trained EnhancedCitationMLP model
-        data: PyTorch Geometric Data object with node features
-        citation_data: Dictionary with partial citation prediction data
-        G: NetworkX graph
-        metadata: Dictionary of paper metadata
-        top_k: Number of top recommendations to consider
-        device: Device to evaluate on ('cuda' or 'cpu')
-        
-    Returns:
-        Dictionary of recommendation metrics
-    """
-    model.eval()
-    node_mapping = citation_data['node_mapping']
-    reverse_mapping = citation_data['reverse_mapping']
-    
-    # Get node embeddings
-    node_features = data.x.to(device)
-    
-    # Group test examples by source paper
-    paper_examples = {}
-    for i, (src, dst, label, _, observed) in enumerate(citation_data['test']['examples']):
-        if src not in paper_examples:
-            paper_examples[src] = {
-                'observed_citations': observed,
-                'held_out_citations': [],
-                'candidates': [],
-                'candidate_indices': []
-            }
-        
-        if label == 1:
-            # This is a held-out citation
-            paper_examples[src]['held_out_citations'].append(dst)
-        
-        # Add to candidates (both positive and negative examples)
-        paper_examples[src]['candidates'].append(dst)
-        paper_examples[src]['candidate_indices'].append(i)
-    
-    # Metrics
-    recall_at_k = []
-    precision_at_k = []
-    ndcg_at_k = []
-    
-    # Process each paper
-    for src_id, paper_data in tqdm(paper_examples.items(), desc="Evaluating recommendations"):
-        # Skip papers with no held-out citations
-        if not paper_data['held_out_citations']:
-            continue
-        
-        # Get candidate indices
-        candidate_indices = paper_data['candidate_indices']
-        candidates = paper_data['candidates']
-        held_out_citations = set(paper_data['held_out_citations'])
-        
-        # Skip if no candidates
-        if not candidate_indices:
-            continue
-        
-        # Get source node index
-        src_idx = node_mapping[src_id]
-        
-        # Get predictions for all candidates
-        candidate_idxs = [node_mapping[c] for c in candidates]
-        src_embeddings = node_features[src_idx].repeat(len(candidate_idxs), 1)
-        tgt_embeddings = node_features[torch.tensor(candidate_idxs, dtype=torch.long).to(device)]
-        
-        # Get edge features for candidates
-        edge_features = citation_data['test']['edge_features'][torch.tensor(candidate_indices)].to(device)
-        
-        # Get predictions
-        with torch.no_grad():
-            outputs = model(src_embeddings, tgt_embeddings, edge_features)
-            probs = outputs.squeeze().cpu().numpy()
-        
-        # Rank candidates by probability
-        ranked_indices = np.argsort(-probs)
-        ranked_candidates = [candidates[i] for i in ranked_indices]
-        
-        # Calculate metrics
-        # Recall@k: proportion of held-out citations in top k recommendations
-        top_k_candidates = ranked_candidates[:top_k]
-        hits = sum(1 for c in top_k_candidates if c in held_out_citations)
-        recall = hits / len(held_out_citations)
-        recall_at_k.append(recall)
-        
-        # Precision@k: proportion of top k recommendations that are correct
-        precision = hits / min(top_k, len(top_k_candidates))
-        precision_at_k.append(precision)
-        
-        # NDCG@k: normalized discounted cumulative gain
-        dcg = 0
-        idcg = 0
-        for i, candidate in enumerate(top_k_candidates):
-            if candidate in held_out_citations:
-                # Log base 2 ranking (starting from 1)
-                dcg += 1 / np.log2(i + 2)
-        
-        # Ideal DCG: all held-out citations at the top positions
-        for i in range(min(len(held_out_citations), top_k)):
-            idcg += 1 / np.log2(i + 2)
-        
-        ndcg = dcg / idcg if idcg > 0 else 0
-        ndcg_at_k.append(ndcg)
-    
-    # Calculate average metrics
-    avg_recall = np.mean(recall_at_k) if recall_at_k else 0
-    avg_precision = np.mean(precision_at_k) if precision_at_k else 0
-    avg_ndcg = np.mean(ndcg_at_k) if ndcg_at_k else 0
-    
-    return {
-        f'recall@{top_k}': avg_recall,
-        f'precision@{top_k}': avg_precision,
-        f'ndcg@{top_k}': avg_ndcg
-    }
-
-def analyze_prediction_feature_importance(model, src_embedding, tgt_embedding, edge_features, edge_feature_names, device='cpu'):
-    """
-    Analyze feature importance for a single prediction by measuring contribution of:
-    1. Node embedding distance/similarity
-    2. Individual edge features
-    
-    Args:
-        model: Trained EnhancedCitationMLP model
-        src_embedding: Source node embedding tensor [embedding_dim]
-        tgt_embedding: Target node embedding tensor [embedding_dim]
-        edge_features: Edge features tensor [edge_feature_dim]
-        edge_feature_names: List of edge feature names
-        device: Device to run on
-        
-    Returns:
-        Dictionary with feature importance analysis
-    """
-    model.eval()
-    model = model.to(device)
-    
-    # Ensure inputs are tensors and on the correct device
-    if not isinstance(src_embedding, torch.Tensor):
-        src_embedding = torch.tensor(src_embedding, dtype=torch.float)
-    if not isinstance(tgt_embedding, torch.Tensor):
-        tgt_embedding = torch.tensor(tgt_embedding, dtype=torch.float)
-    if not isinstance(edge_features, torch.Tensor):
-        edge_features = torch.tensor(edge_features, dtype=torch.float)
-    
-    # Ensure all tensors have batch dimension (add if missing)
-    if src_embedding.dim() == 1:
-        src_embedding = src_embedding.unsqueeze(0)  # Add batch dim
-    if tgt_embedding.dim() == 1:
-        tgt_embedding = tgt_embedding.unsqueeze(0)  # Add batch dim
-    if edge_features.dim() == 1:
-        edge_features = edge_features.unsqueeze(0)  # Add batch dim
-    
-    # Move to device
-    src_embedding = src_embedding.to(device)
-    tgt_embedding = tgt_embedding.to(device)
-    edge_features = edge_features.to(device)
-    
-    # Get baseline prediction
-    with torch.no_grad():
-        baseline_output = model(src_embedding, tgt_embedding, edge_features)
-        baseline_score = baseline_output.item()
-    
-    # Calculate node embedding similarity metrics
-    node_embedding_dim = src_embedding.shape[1]
-    
-    # Cosine similarity
-    cosine_sim = torch.nn.functional.cosine_similarity(src_embedding, tgt_embedding, dim=1).item()
-    
-    # Euclidean distance (normalized by embedding dimension)
-    euclidean_dist = torch.norm(src_embedding - tgt_embedding, dim=1).item() / np.sqrt(node_embedding_dim)
-    
-    # L1 distance (normalized)
-    l1_dist = torch.norm(src_embedding - tgt_embedding, p=1, dim=1).item() / node_embedding_dim
-    
-    # Test importance of node embeddings vs edge features
-    # 1. Prediction with zero node embeddings (only edge features)
-    zero_embeddings = torch.zeros_like(src_embedding)
-    with torch.no_grad():
-        edge_only_output = model(zero_embeddings, zero_embeddings, edge_features)
-        edge_only_score = edge_only_output.item()
-    
-    # 2. Prediction with zero edge features (only node embeddings)
-    zero_edge_features = torch.zeros_like(edge_features)
-    with torch.no_grad():
-        embedding_only_output = model(src_embedding, tgt_embedding, zero_edge_features)
-        embedding_only_score = embedding_only_output.item()
-    
-    # Calculate contributions
-    node_embedding_contribution = abs(baseline_score - edge_only_score)
-    edge_feature_contribution = abs(baseline_score - embedding_only_score)
-    
-    # Analyze individual edge feature importance
-    edge_importance = {}
-    for i, feature_name in enumerate(edge_feature_names):
-        # Create modified edge features with this feature zeroed out
-        modified_edge_features = edge_features.clone()
-        modified_edge_features[0, i] = 0
-        
-        with torch.no_grad():
-            modified_output = model(src_embedding, tgt_embedding, modified_edge_features)
-            modified_score = modified_output.item()
-        
-        # Importance is the absolute change in prediction
-        importance = abs(baseline_score - modified_score)
-        edge_importance[feature_name] = {
-            'importance': importance,
-            'feature_value': edge_features[0, i].item(),
-            'score_change': baseline_score - modified_score
-        }
-    
-    # Sort edge features by importance
-    sorted_edge_importance = dict(sorted(edge_importance.items(), 
-                                       key=lambda x: x[1]['importance'], 
-                                       reverse=True))
-    
-    return {
-        'baseline_score': baseline_score,
-        'node_embedding_metrics': {
-            'cosine_similarity': cosine_sim,
-            'euclidean_distance': euclidean_dist,
-            'l1_distance': l1_dist,
-            'contribution': node_embedding_contribution,
-            'embedding_only_score': embedding_only_score
-        },
-        'edge_feature_metrics': {
-            'total_contribution': edge_feature_contribution,
-            'edge_only_score': edge_only_score,
-            'individual_importance': sorted_edge_importance
-        },
-        'contribution_breakdown': {
-            'node_embeddings': node_embedding_contribution,
-            'edge_features': edge_feature_contribution,
-            'node_embedding_percentage': node_embedding_contribution / (node_embedding_contribution + edge_feature_contribution) * 100 if (node_embedding_contribution + edge_feature_contribution) > 0 else 0,
-            'edge_feature_percentage': edge_feature_contribution / (node_embedding_contribution + edge_feature_contribution) * 100 if (node_embedding_contribution + edge_feature_contribution) > 0 else 0
-        }
-    }
-
-def main():
-    """
-    Main function to build the GNN graph and prepare data for citation prediction.
-    """
-    print("Building GNN model for citation recommendation...")
-    
-    # Add PyTorch Geometric classes to safe globals
-    try:
-        from torch.serialization import add_safe_globals
-        from torch_geometric.data.data import Data, DataEdgeAttr, DataTensorAttr
-        add_safe_globals([Data, DataEdgeAttr, DataTensorAttr])
-        print("Added PyTorch Geometric classes to safe globals")
-    except ImportError:
-        print("Could not import add_safe_globals or PyTorch Geometric classes")
-    
-    # Create cache directory
-    os.makedirs('cache_gnn', exist_ok=True)
-    
-    # Define cache paths
-    articles_cache_path = 'cache_gnn/articles.pkl'
-    gnn_graph_cache_path = 'cache_gnn/gnn_citation_graph.gpickle'
-    gnn_metadata_cache_path = 'cache_gnn/gnn_paper_metadata.json'
-    author_graph_cache_path = 'cache_gnn/author_coauthor_graph.pkl'
-    gnn_data_path = 'cache_gnn/gnn_data.pt'
-    partial_citation_data_path = 'cache_gnn/partial_citation_prediction_data.pt'
-    partial_model_path = 'cache_gnn/partial_citation_mlp_model.pt'
-    
-    # Step 1: Load articles (already handles caching)
-    articles = load_articles()
-    
-    # Step 2: Build GNN graph (already handles caching)
-    G, metadata, main_article_count = build_gnn_graph(articles)
-    
-    # Step 3: Build author coauthorship graph
-    if os.path.exists(author_graph_cache_path):
-        print("Loading author coauthorship graph from cache...")
-        with open(author_graph_cache_path, 'rb') as f:
-            author_coauthor_G = pkl.load(f)
-    else:
-        print("Building author coauthorship graph...")
-        author_coauthor_G = process_articles_to_author_graphs(articles)
-        # Cache the author graph
-        print("Saving author coauthorship graph to cache...")
-        with open(author_graph_cache_path, 'wb') as f:
-            pkl.dump(author_coauthor_G, f)
-    
-    # Step 4: Convert to PyTorch Geometric format
-    if os.path.exists(gnn_data_path):
+        print("Building graph with embeddings...")
+        G, metadata, main_article_count, paper_embeddings_dict = build_gnn_graph(articles)
+        # Save graph components immediately
+        print("Saving graph components to cache...")
+        with open(graph_cache_path, 'wb') as f:
+            pkl.dump(G, f)
+        with open(metadata_cache_path, 'w') as f:
+            json.dump(metadata, f)
+        with open(embeddings_cache_path, 'wb') as f:
+            pkl.dump(paper_embeddings_dict, f)
+        print("Graph components cached successfully")
+    
+    # Step 3: Convert to PyTorch Geometric (with caching)
+    data_cache_path = 'cache_gnn/gnn_data.pt'
+    if os.path.exists(data_cache_path):
         print("Loading PyTorch Geometric data from cache...")
-        try:
-            data = torch.load(gnn_data_path, weights_only=False)
-            print("Successfully loaded PyTorch Geometric data")
-        except Exception as e:
-            print(f"Error loading PyTorch Geometric data: {e}")
-            print("Converting graph to PyTorch Geometric format...")
-            data = convert_to_pytorch_geometric(G, metadata)
-            print("Saving PyTorch Geometric data to cache...")
-            torch.save(data, gnn_data_path)
+        data = torch.load(data_cache_path, weights_only=False)
+        print(f"Loaded PyTorch Geometric data with {data.num_nodes} nodes from cache")
     else:
-        print("Converting graph to PyTorch Geometric format...")
+        print("Converting to PyTorch Geometric format...")
         data = convert_to_pytorch_geometric(G, metadata)
+        # Save data immediately
         print("Saving PyTorch Geometric data to cache...")
-        torch.save(data, gnn_data_path)
+        torch.save(data, data_cache_path)
+        print("PyTorch Geometric data cached successfully")
     
-    # Step 5: Prepare partial citation prediction data
-    if os.path.exists(partial_citation_data_path):
-        print("Loading partial citation prediction data from cache...")
-        try:
-            partial_citation_data = torch.load(partial_citation_data_path, weights_only=False)
-            print("Successfully loaded partial citation prediction data")
-        except Exception as e:
-            print(f"Error loading partial citation prediction data: {e}")
-            print("Preparing partial citation prediction data...")
-            partial_citation_data = prepare_partial_citation_prediction_data(G, metadata, author_coauthor_G, observed_ratio=0.75)
-            print("Saving partial citation prediction data to cache...")
-            torch.save(partial_citation_data, partial_citation_data_path)
+    # Step 4: Prepare citation prediction data (with caching)
+    citation_data_cache_path = 'cache_gnn/citation_prediction_data.pt'
+    if os.path.exists(citation_data_cache_path):
+        print("Loading citation prediction data from cache...")
+        citation_data = torch.load(citation_data_cache_path, weights_only=False)
+        print(f"Loaded citation data with {len(citation_data['train']['examples'])} train and {len(citation_data['test']['examples'])} test examples from cache")
     else:
-        print("Preparing partial citation prediction data...")
-        partial_citation_data = prepare_partial_citation_prediction_data(G, metadata, author_coauthor_G, observed_ratio=0.75)
-        print("Saving partial citation prediction data to cache...")
-        torch.save(partial_citation_data, partial_citation_data_path)
+        print("Preparing citation prediction data...")
+        citation_data = prepare_citation_prediction_data(G, metadata, paper_embeddings_dict)
+        # Save citation data immediately
+        print("Saving citation prediction data to cache...")
+        torch.save(citation_data, citation_data_cache_path)
+        print("Citation prediction data cached successfully")
     
-    # Set device
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    print(f"Using device: {device}")
+    # Step 5: Train model (with caching and checkpoints)
+    model_cache_path = 'cache_gnn/graphsage_citation_model.pt'
+    training_history_cache_path = 'cache_gnn/training_history.pkl'
     
-    # Step 6: Train or load model for partial citation prediction
-    model_exists = os.path.exists(partial_model_path)
-    train_new_model = True
-    
-    if model_exists:
-        user_input = input("A trained partial citation model already exists. Train a new model? (y/n): ")
-        train_new_model = user_input.lower() == 'y'
-    
-    if train_new_model:
-        # Train model
-        print("Training partial citation prediction model...")
-        model, history = train_partial_citation_mlp(
+    if os.path.exists(model_cache_path):
+        print("Loading trained model from cache...")
+        # Get dimensions to initialize model
+        input_dim = data.num_node_features
+        edge_feature_dim = citation_data['train']['edge_features'].shape[1]
+        
+        # Initialize model
+        model = GraphSAGECitationModel(
+            input_dim=input_dim,
+            hidden_dim=128,
+            num_layers=2,
+            edge_feature_dim=edge_feature_dim,
+            dropout=0.2
+        )
+        model.load_state_dict(torch.load(model_cache_path))
+        
+        # Load training history if available
+        if os.path.exists(training_history_cache_path):
+            with open(training_history_cache_path, 'rb') as f:
+                history = pkl.load(f)
+        else:
+            history = {'loss': [], 'val_loss': [], 'val_auc': []}
+        
+        print("Trained model loaded from cache")
+    else:
+        print("Training GraphSAGE model with optimizations...")
+        print(f"Using device: {device}")
+        
+        model, history = train_graphsage_model(
             data, 
-            partial_citation_data, 
-            device=device,
-            batch_size=64,
-            epochs=5,
-            lr=0.001
+            citation_data, 
+            device=device, 
+            epochs=epochs,
+            batch_size=batch_size,
+            lr=lr,
+            optimize_batch_size=optimize_batch_size,
+            use_mixed_precision=use_mixed_precision,
+            gradient_accumulation_steps=gradient_accumulation_steps,
+            num_workers=num_workers,
+            pin_memory=pin_memory
         )
         
-        # Plot training history
-        print("Plotting training history...")
-        plot_training_history(history)
-        
-        # Save model
-        print("Saving model...")
-        torch.save(model.state_dict(), partial_model_path)
-    else:
-        # Load existing model
-        print("Loading trained model from cache...")
-        node_embedding_dim = data.num_node_features
-        edge_feature_dim = partial_citation_data['train']['edge_features'].shape[1]
-        model = EnhancedCitationMLP(node_embedding_dim, edge_feature_dim)
-        model.load_state_dict(torch.load(partial_model_path))
-        model = model.to(device)
+        # Save model and history immediately after training
+        print("Saving trained model to cache...")
+        torch.save(model.state_dict(), model_cache_path)
+        with open(training_history_cache_path, 'wb') as f:
+            pkl.dump(history, f)
+        print("Trained model cached successfully")
     
-    # Step 7: Evaluate model
-    print("Evaluating model...")
-    metrics = evaluate_partial_citation_mlp(model, data, partial_citation_data, device)
+    print("All steps completed successfully!")
+    print("Cache summary:")
+    print(f"  - Articles: {articles_cache_path}")
+    print(f"  - Graph: {graph_cache_path}")
+    print(f"  - Metadata: {metadata_cache_path}")
+    print(f"  - Embeddings: {embeddings_cache_path}")
+    print(f"  - PyTorch Geometric data: {data_cache_path}")
+    print(f"  - Citation prediction data: {citation_data_cache_path}")
+    print(f"  - Trained model: {model_cache_path}")
+    print(f"  - Training history: {training_history_cache_path}")
     
-    # Print metrics
-    print("\nFinal Evaluation Metrics:")
-    print(f"Accuracy: {metrics['accuracy']:.4f}")
-    print(f"Precision: {metrics['precision']:.4f}")
-    print(f"Recall: {metrics['recall']:.4f}")
-    print(f"F1 Score: {metrics['f1']:.4f}")
-    print(f"AUC: {metrics['auc']:.4f}")
-    
-    # Plot confusion matrix
-    print("\nGenerating confusion matrix...")
-    y_true = np.array(metrics['labels'])
-    y_pred = np.array(metrics['probabilities']) > 0.5
-    y_pred = y_pred.astype(int)
-    plot_confusion_matrix(y_true, y_pred, normalize=False, title='Partial Citation Prediction Confusion Matrix')
-    plot_confusion_matrix(y_true, y_pred, normalize=True, title='Partial Citation Prediction Normalized Confusion Matrix')
-    
-    # Step 8: Evaluate citation recommendations
-    print("\nEvaluating citation recommendations...")
-    recommendation_metrics = evaluate_citation_recommendations(model, data, partial_citation_data, G, metadata, top_k=10, device=device)
-    
-    print("\nCitation Recommendation Metrics:")
-    for metric, value in recommendation_metrics.items():
-        print(f"{metric}: {value:.4f}")
-    
-    # Step 9: Analyze feature importance
-    print("\nAnalyzing feature importance...")
-    feature_importance = analyze_feature_importance(model, data, partial_citation_data, device)
-    
-    print("\nEdge Feature Importance:")
-    for feature, importance in feature_importance.items():
-        print(f"{feature}: {importance:.4f}")
-    
-    print("GNN partial citation prediction pipeline complete!")
+    return model, data, citation_data
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description='GraphSAGE Citation Recommendation Model')
+    parser.add_argument('--action', choices=['train', 'clear_cache', 'check_cache'], 
+                       default='train', help='Action to perform')
+    parser.add_argument('--epochs', type=int, default=1, help='Number of training epochs')
+    parser.add_argument('--batch_size', type=int, default=64, help='Initial batch size for training')
+    parser.add_argument('--lr', type=float, default=0.001, help='Learning rate')
+    parser.add_argument('--device', choices=['cpu', 'cuda', 'auto'], default='auto', 
+                       help='Device to use for training')
+    parser.add_argument('--save_checkpoints', action='store_true', default=True,
+                       help='Save model checkpoints during training')
+    parser.add_argument('--checkpoint_every', type=int, default=5,
+                       help='Save checkpoint every N epochs')
+    
+    # New optimization parameters
+    parser.add_argument('--optimize_batch_size', action='store_true', default=True,
+                       help='Automatically find optimal batch size for GPU')
+    parser.add_argument('--mixed_precision', action='store_true', default=True,
+                       help='Use automatic mixed precision training (faster on modern GPUs)')
+    parser.add_argument('--gradient_accumulation_steps', type=int, default=1,
+                       help='Accumulate gradients over multiple batches')
+    parser.add_argument('--num_workers', type=int, default=12,
+                       help='Number of workers for data loading')
+    parser.add_argument('--no_pin_memory', action='store_true',
+                       help='Disable pinned memory for GPU transfer')
+    
+    args = parser.parse_args()
+    
+    if args.action == 'clear_cache':
+        clear_cache()
+    elif args.action == 'check_cache':
+        get_cache_status()
+    else:  # train
+        # Determine device
+        if args.device == 'auto':
+            device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        else:
+            device = args.device
+            
+        pin_memory = not args.no_pin_memory
+        
+        print(f"Starting optimized training with device: {device}")
+        print(f"Epochs: {args.epochs}, Initial batch size: {args.batch_size}, Learning rate: {args.lr}")
+        print(f"Optimizations:")
+        print(f"  Auto batch size: {args.optimize_batch_size}")
+        print(f"  Mixed precision: {args.mixed_precision}")
+        print(f"  Gradient accumulation steps: {args.gradient_accumulation_steps}")
+        print(f"  Data loading workers: {args.num_workers}")
+        print(f"  Pin memory: {pin_memory}")
+        
+        # Check cache status before starting
+        print("\n" + "="*50)
+        print("CACHE STATUS BEFORE TRAINING")
+        print("="*50)
+        get_cache_status()
+        print("="*50 + "\n")
+        
+        # Run main training pipeline with optimizations
+        model, data, citation_data = main(
+            optimize_batch_size=args.optimize_batch_size,
+            use_mixed_precision=args.mixed_precision,
+            gradient_accumulation_steps=args.gradient_accumulation_steps,
+            num_workers=args.num_workers,
+            pin_memory=pin_memory,
+            epochs=args.epochs,
+            batch_size=args.batch_size,
+            lr=args.lr,
+            device=device
+        )
+        
+        print("\n" + "="*50)
+        print("TRAINING COMPLETED SUCCESSFULLY")
+        print("="*50)
+        get_cache_status()
+        print("="*50) 

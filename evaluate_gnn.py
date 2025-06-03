@@ -2,9 +2,9 @@
 # -*- coding: utf-8 -*-
 
 """
-Evaluate GNN model for citation recommendation.
+Evaluate GraphSAGE model for citation recommendation.
 
-This script loads a trained GNN model and recommends additional citations
+This script loads a trained GraphSAGE model and recommends additional citations
 for a paper with partial citation information.
 
 The script supports both transductive and inductive settings:
@@ -29,33 +29,34 @@ from create_gnn_graphs import (
     get_journal_encoding, should_filter_title
 )
 from gnn_model import (
-    EnhancedCitationMLP, extract_edge_features, 
+    GraphSAGECitationModel, extract_edge_features, 
     generate_node_features_for_new_paper, inductive_recommend_citations,
-    inductive_evaluate_with_held_out, analyze_prediction_feature_importance
+    inductive_evaluate_with_held_out
 )
 
 def load_model_and_data(cache_dir='cache_gnn'):
     """
-    Load the trained model and graph data from cache.
+    Load the trained GraphSAGE model and graph data from cache.
     If cache files are missing, regenerate them.
     
     Args:
         cache_dir: Directory containing cached files
         
     Returns:
-        Tuple of (model, graph, metadata, node_features, node_mapping)
+        Tuple of (model, graph, metadata, data, paper_embeddings_dict)
     """
-    print("Loading model and data from cache...")
+    print("Loading GraphSAGE model and data from cache...")
     
     # Define cache paths
     gnn_graph_path = os.path.join(cache_dir, 'gnn_citation_graph.gpickle')
     gnn_metadata_path = os.path.join(cache_dir, 'gnn_paper_metadata.json')
     gnn_data_path = os.path.join(cache_dir, 'gnn_data.pt')
-    model_path = os.path.join(cache_dir, 'partial_citation_mlp_model.pt')
-    author_graph_path = os.path.join(cache_dir, 'author_coauthor_graph.pkl')
+    model_path = os.path.join(cache_dir, 'graphsage_citation_model.pt')
+    embeddings_path = os.path.join(cache_dir, 'paper_embeddings_dict.pkl')
+    citation_data_path = os.path.join(cache_dir, 'citation_prediction_data.pt')
     
     # Check if all required files exist
-    required_files = [gnn_graph_path, gnn_metadata_path, gnn_data_path, model_path]
+    required_files = [gnn_graph_path, gnn_metadata_path, gnn_data_path, model_path, embeddings_path]
     missing_files = [f for f in required_files if not os.path.exists(f)]
     
     if missing_files:
@@ -84,43 +85,37 @@ def load_model_and_data(cache_dir='cache_gnn'):
     with open(gnn_metadata_path, 'r') as f:
         metadata = json.load(f)
     
-    # Load author coauthorship graph if available
-    author_coauthor_G = None
-    if os.path.exists(author_graph_path):
-        print("Loading author coauthorship graph...")
-        with open(author_graph_path, 'rb') as f:
-            author_coauthor_G = pkl.load(f)
+    # Load paper embeddings dictionary
+    print("Loading paper embeddings...")
+    with open(embeddings_path, 'rb') as f:
+        paper_embeddings_dict = pkl.load(f)
     
     # Load PyTorch Geometric data
     print("Loading PyTorch Geometric data...")
     data = torch.load(gnn_data_path, weights_only=False)
     
-    # Get node features and mapping
-    node_features = data.x
-    node_mapping = data.node_mapping if hasattr(data, 'node_mapping') else None
-    reverse_mapping = data.reverse_mapping if hasattr(data, 'reverse_mapping') else None
+    # Load citation training data to get dimensions
+    citation_data = torch.load(citation_data_path, weights_only=False)
     
     # Load model
-    print("Loading trained model...")
-    node_embedding_dim = data.num_node_features
-    # Determine edge feature dimension from a sample edge
-    sample_edge_features = extract_edge_features(
-        list(G.nodes())[0], 
-        list(G.successors(list(G.nodes())[0]))[0] if list(G.successors(list(G.nodes())[0])) else list(G.nodes())[1],
-        G, 
-        metadata,
-        author_coauthor_G
-    )
-    edge_feature_dim = len(sample_edge_features)
+    print("Loading trained GraphSAGE model...")
+    input_dim = data.num_node_features
+    edge_feature_dim = citation_data['train']['edge_features'].shape[1]
     
     # Initialize and load model
-    model = EnhancedCitationMLP(node_embedding_dim, edge_feature_dim)
+    model = GraphSAGECitationModel(
+        input_dim=input_dim,
+        hidden_dim=128,
+        num_layers=2,
+        edge_feature_dim=edge_feature_dim,
+        dropout=0.2
+    )
     model.load_state_dict(torch.load(model_path))
     model.eval()
     
-    print("Successfully loaded model and data")
+    print("Successfully loaded GraphSAGE model and data")
     
-    return model, G, metadata, node_features, node_mapping, reverse_mapping, author_coauthor_G
+    return model, G, metadata, data, paper_embeddings_dict
 
 def parse_paper(paper_json, G, metadata):
     """
@@ -179,9 +174,9 @@ def parse_paper(paper_json, G, metadata):
     
     return paper_id, observed_citations, paper_data
 
-def recommend_citations(paper_id, observed_citations, G, metadata, model, node_features, 
-                       node_mapping, reverse_mapping, author_coauthor_G, top_k=10, 
-                       exclude_observed=True, device='cpu', include_feature_importance=False):
+def recommend_citations(paper_id, observed_citations, G, metadata, model, data, 
+                       paper_embeddings_dict, top_k=10, exclude_observed=True, 
+                       device='cpu', include_feature_importance=False):
     """
     Recommend citations for a paper based on partial citation information.
     
@@ -190,11 +185,9 @@ def recommend_citations(paper_id, observed_citations, G, metadata, model, node_f
         observed_citations: List of observed citation IDs
         G: NetworkX graph
         metadata: Dictionary of paper metadata
-        model: Trained EnhancedCitationMLP model
-        node_features: Node feature tensor
-        node_mapping: Mapping from node IDs to indices
-        reverse_mapping: Mapping from indices to node IDs
-        author_coauthor_G: Author coauthorship graph
+        model: Trained GraphSAGE model
+        data: PyTorch Geometric Data object
+        paper_embeddings_dict: Dictionary of paper embeddings
         top_k: Number of top recommendations to return
         exclude_observed: Whether to exclude observed citations from recommendations
         device: Device to run the model on
@@ -208,12 +201,12 @@ def recommend_citations(paper_id, observed_citations, G, metadata, model, node_f
         print(f"Error: Paper ID {paper_id} not found in graph")
         return []
     
-    # Move model and node features to device
+    # Move model and data to device
     model = model.to(device)
-    node_features = node_features.to(device)
+    data = data.to(device)
     
     # Get source node index
-    src_idx = node_mapping[paper_id]
+    src_idx = data.node_mapping[paper_id]
     
     # Get candidate papers (all papers except the source paper)
     candidates = [node for node in G.nodes() if node != paper_id]
@@ -230,13 +223,7 @@ def recommend_citations(paper_id, observed_citations, G, metadata, model, node_f
     # Process candidates in batches
     for i in range(0, len(candidates), batch_size):
         batch_candidates = candidates[i:i+batch_size]
-        batch_idxs = [node_mapping[c] for c in batch_candidates]
-        
-        # Get source embeddings (repeated for each candidate)
-        src_embeddings = node_features[src_idx].repeat(len(batch_candidates), 1)
-        
-        # Get target embeddings
-        tgt_embeddings = node_features[torch.tensor(batch_idxs, dtype=torch.long).to(device)]
+        batch_tgt_idxs = [data.node_mapping[c] for c in batch_candidates]
         
         # Extract edge features for each candidate
         edge_features = []
@@ -246,19 +233,22 @@ def recommend_citations(paper_id, observed_citations, G, metadata, model, node_f
                 candidate, 
                 G, 
                 metadata, 
-                author_coauthor_G,
+                paper_embeddings_dict,
                 observed_citations_only=True,
                 observed_citations=observed_citations
             )
             edge_features.append(list(features.values()))
         
-        # Convert edge features to tensor
-        edge_features_tensor = torch.tensor(edge_features, dtype=torch.float).to(device)
         all_edge_features.extend(edge_features)
+        
+        # Create tensors
+        src_tensor = torch.tensor([src_idx] * len(batch_candidates), dtype=torch.long).to(device)
+        tgt_tensor = torch.tensor(batch_tgt_idxs, dtype=torch.long).to(device)
+        edge_tensor = torch.tensor(edge_features, dtype=torch.float).to(device)
         
         # Get predictions
         with torch.no_grad():
-            outputs = model(src_embeddings, tgt_embeddings, edge_features_tensor)
+            outputs = model(data.x, data.edge_index, src_tensor, tgt_tensor, edge_tensor)
             probs = outputs.squeeze().cpu().numpy()
         
         all_probs.extend(probs)
@@ -267,26 +257,10 @@ def recommend_citations(paper_id, observed_citations, G, metadata, model, node_f
     ranked_indices = np.argsort(-np.array(all_probs))
     ranked_candidates = [candidates[i] for i in ranked_indices]
     ranked_probs = [all_probs[i] for i in ranked_indices]
-    ranked_edge_features = [all_edge_features[i] for i in ranked_indices]
-    
-    # Get edge feature names
-    if candidates:
-        sample_features = extract_edge_features(
-            paper_id, 
-            candidates[0], 
-            G, 
-            metadata, 
-            author_coauthor_G,
-            observed_citations_only=True,
-            observed_citations=observed_citations
-        )
-        edge_feature_names = list(sample_features.keys())
-    else:
-        edge_feature_names = []
     
     # Get top-k recommendations
     recommendations = []
-    for i, (candidate, prob, edge_feat) in enumerate(zip(ranked_candidates[:top_k], ranked_probs[:top_k], ranked_edge_features[:top_k])):
+    for i, (candidate, prob) in enumerate(zip(ranked_candidates[:top_k], ranked_probs[:top_k])):
         # Get metadata for the candidate
         candidate_metadata = metadata.get(candidate, {})
         recommendation = {
@@ -298,26 +272,13 @@ def recommend_citations(paper_id, observed_citations, G, metadata, model, node_f
             'score': float(prob)
         }
         
-        # Add feature importance analysis if requested
-        if include_feature_importance:
-            src_embedding = node_features[src_idx]
-            tgt_idx = node_mapping[candidate]
-            tgt_embedding = node_features[tgt_idx]
-            edge_features_tensor = torch.tensor(edge_feat, dtype=torch.float)
-            
-            importance_analysis = analyze_prediction_feature_importance(
-                model, src_embedding, tgt_embedding, edge_features_tensor, 
-                edge_feature_names, device
-            )
-            recommendation['feature_importance'] = importance_analysis
-        
         recommendations.append(recommendation)
     
     return recommendations
 
-def evaluate_with_held_out(paper_json, G, metadata, model, node_features, node_mapping, 
-                          reverse_mapping, author_coauthor_G, observed_ratio=0.75, 
-                          top_k=10, device='cpu', include_feature_importance=False, random_seed=111):
+def evaluate_with_held_out(paper_json, G, metadata, model, data, paper_embeddings_dict,
+                          observed_ratio=0.75, top_k=10, device='cpu', 
+                          include_feature_importance=False, random_seed=111):
     """
     Evaluate citation recommendations against held-out citations.
     
@@ -325,16 +286,14 @@ def evaluate_with_held_out(paper_json, G, metadata, model, node_features, node_m
         paper_json: Dictionary containing paper information
         G: NetworkX graph
         metadata: Dictionary of paper metadata
-        model: Trained EnhancedCitationMLP model
-        node_features: Node feature tensor
-        node_mapping: Mapping from node IDs to indices
-        reverse_mapping: Mapping from indices to node IDs
-        author_coauthor_G: Author co-authorship graph
+        model: Trained GraphSAGE model
+        data: PyTorch Geometric Data object
+        paper_embeddings_dict: Dictionary of paper embeddings
         observed_ratio: Ratio of citations to observe
         top_k: Number of top recommendations to consider
         device: Device to run the model on
         include_feature_importance: Whether to include feature importance analysis
-        random_seed: Random seed for reproducible citation splitting (default: 111)
+        random_seed: Random seed for reproducible citation splitting
         
     Returns:
         Dictionary of evaluation metrics and recommendations
@@ -369,10 +328,8 @@ def evaluate_with_held_out(paper_json, G, metadata, model, node_features, node_m
         G, 
         metadata, 
         model, 
-        node_features, 
-        node_mapping, 
-        reverse_mapping, 
-        author_coauthor_G,
+        data,
+        paper_embeddings_dict,
         top_k=top_k,
         exclude_observed=True,
         device=device,
@@ -418,8 +375,8 @@ def evaluate_with_held_out(paper_json, G, metadata, model, node_features, node_m
         'held_out_citation_ids': held_out_citations
     }
 
-def recommend_for_paper(paper_json, G, metadata, model, node_features, node_mapping, 
-                       reverse_mapping, author_coauthor_G, top_k=10, device='cpu', include_feature_importance=False):
+def recommend_for_paper(paper_json, G, metadata, model, data, paper_embeddings_dict,
+                       top_k=10, device='cpu', include_feature_importance=False):
     """
     Recommend citations for a paper based on its existing citations.
     
@@ -427,11 +384,9 @@ def recommend_for_paper(paper_json, G, metadata, model, node_features, node_mapp
         paper_json: Dictionary containing paper information
         G: NetworkX graph
         metadata: Dictionary of paper metadata
-        model: Trained EnhancedCitationMLP model
-        node_features: Node feature tensor
-        node_mapping: Mapping from node IDs to indices
-        reverse_mapping: Mapping from indices to node IDs
-        author_coauthor_G: Author co-authorship graph
+        model: Trained GraphSAGE model
+        data: PyTorch Geometric Data object
+        paper_embeddings_dict: Dictionary of paper embeddings
         top_k: Number of top recommendations to return
         device: Device to run the model on
         include_feature_importance: Whether to include feature importance analysis
@@ -455,10 +410,8 @@ def recommend_for_paper(paper_json, G, metadata, model, node_features, node_mapp
         G, 
         metadata, 
         model, 
-        node_features, 
-        node_mapping, 
-        reverse_mapping, 
-        author_coauthor_G,
+        data,
+        paper_embeddings_dict,
         top_k=top_k,
         exclude_observed=True,
         device=device,
@@ -475,7 +428,7 @@ def recommend_for_paper(paper_json, G, metadata, model, node_features, node_mapp
 
 def main():
     """Main function to run the evaluation."""
-    parser = argparse.ArgumentParser(description='Evaluate GNN model for citation recommendation')
+    parser = argparse.ArgumentParser(description='Evaluate GraphSAGE model for citation recommendation')
     parser.add_argument('--input', type=str, help='Path to input JSON file containing paper information')
     parser.add_argument('--output', type=str, default='recommendations.json', help='Path to output JSON file')
     parser.add_argument('--top-k', type=int, default=10, help='Number of top recommendations to return')
@@ -499,7 +452,7 @@ def main():
         args.device = 'cpu'
     
     # Load model and data
-    model, G, metadata, node_features, node_mapping, reverse_mapping, author_coauthor_G = load_model_and_data()
+    model, G, metadata, data, paper_embeddings_dict = load_model_and_data()
     
     # Load input paper
     if args.input:
@@ -508,16 +461,16 @@ def main():
     else:
         # Use example paper
         paper_json = {
-            "doi": "10.1016/j.jfineco.2024.103897", 
+            "doi": "10.1111/jofi.13455", 
             "type": "journal-article", 
-            "published_date": "2024-09-01", 
-            "title": "Are cryptos different? Evidence from retail trading", 
-            "journal": "Journal of Financial Economics", 
-            "abstract": None, 
-            "volume": "159", 
+            "published_date": "2025-04-01", 
+            "title": "Women in Charge: Evidence from Hospitals", 
+            "journal": "The Journal of Finance", 
+            "abstract": "<jats:title>ABSTRACT</jats:title><jats:p>The paper examines the decision‐making, compensation, and turnover of female CEOs in U.S. hospitals. Contrary to the literature on lower‐ranked executives and directors in public firms, there is no evidence that gender differences in preferences for risk or altruism affect decision‐making of hospital CEOs: corporate policies do not shift when women take (or leave) office, and male and female CEOs respond similarly to a major financial shock. However, female CEOs earn lower salaries, face flatter pay‐for‐performance incentives, and exhibit greater turnover after poor performance. Hospital boards behave as though they perceive female CEOs as less productive.</jats:p>", 
+            "volume": None, 
             "issue": None, 
-            "authors": [["Shimon", "Kogan", None], ["Igor", "Makarov", None], ["Marina", "Niessner", None], ["Antoinette", "Schoar", None]], 
-            "references": [{"reference_type": "book", "doi": "10.1016/b978-0-12-822927-9.00024-0", "year": 2023, "title": "Expectations data in asset pricing", "journal": "Handbook of Economic Expectations", "volume": None, "issue": None, "authors": [["Klaus", "Adam", None], ["Stefan", "Nagel", None]], "working_paper_institution": None}, {"reference_type": "working_paper", "doi": "10.3386/w31856", "year": None, "title": "Who Invests in Crypto? Wealth, Financial Constraints, and Risk Attitudes", "journal": None, "volume": None, "issue": None, "authors": [["Darren", "Aiello", None], ["Scott", "Baker", None], ["Tetyana", "Balyuk", None], ["Marco Di", "Maggio", None], ["Mark", "Johnson", None], ["Jason", "Kotter", None]], "working_paper_institution": None}, {"title": "Regulating cryptocurrencies: Assessing market reactions", "author": "Auer", "year": "2018", "journal": "BIS Q. Rev. Sept.", "reference_type": "article"}, {"reference_type": "article", "doi": "10.1111/0022-1082.00226", "year": 2000, "title": "Trading Is Hazardous to Your Wealth: The Common Stock Investment Performance of Individual Investors", "journal": "The Journal of Finance", "volume": "55", "issue": "2", "authors": [["Brad M.", "Barber", None], ["Terrance", "Odean", None]], "working_paper_institution": None}, {"reference_type": "article", "doi": "10.1016/j.jfineco.2018.04.007", "year": 2018, "title": "Extrapolation and bubbles", "journal": "Journal of Financial Economics", "volume": "129", "issue": "2", "authors": [["Nicholas", "Barberis", None], ["Robin", "Greenwood", None], ["Lawrence", "Jin", None], ["Andrei", "Shleifer", None]], "working_paper_institution": None}]
+            "authors": [["KATHARINA", "LEWELLEN", None]], 
+            "references": [{"reference_type": "article", "doi": "10.1016/j.jfineco.2008.10.007", "year": 2009, "title": "Women in the boardroom and their impact on governance and performance⁎", "journal": "Journal of Financial Economics", "volume": "94", "issue": "2", "authors": [["Renée B.", "Adams", None], ["Daniel", "Ferreira", None]], "working_paper_institution": None}]
         }
     
     # Check if paper exists in graph
@@ -540,10 +493,8 @@ def main():
                 G, 
                 metadata, 
                 model, 
-                node_features, 
-                node_mapping, 
-                reverse_mapping, 
-                author_coauthor_G,
+                data,
+                paper_embeddings_dict,
                 observed_ratio=args.observed_ratio,
                 top_k=args.top_k,
                 device=args.device,
@@ -557,10 +508,8 @@ def main():
                 G, 
                 metadata, 
                 model, 
-                node_features, 
-                node_mapping, 
-                reverse_mapping, 
-                author_coauthor_G,
+                data,
+                paper_embeddings_dict,
                 top_k=args.top_k,
                 device=args.device,
                 include_feature_importance=args.feature_importance
@@ -582,10 +531,8 @@ def main():
                 G, 
                 metadata, 
                 model, 
-                node_features, 
-                node_mapping, 
-                reverse_mapping, 
-                author_coauthor_G,
+                data,
+                paper_embeddings_dict,
                 observed_ratio=args.observed_ratio,
                 top_k=args.top_k,
                 device=args.device,
@@ -598,10 +545,8 @@ def main():
                 G, 
                 metadata, 
                 model, 
-                node_features, 
-                node_mapping, 
-                reverse_mapping, 
-                author_coauthor_G,
+                data,
+                paper_embeddings_dict,
                 top_k=args.top_k,
                 device=args.device,
                 include_feature_importance=args.feature_importance
